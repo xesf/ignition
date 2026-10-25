@@ -3,8 +3,10 @@
 The Android host is `src/platform/android.c`, on the NDK: a
 NativeActivity through `android_native_app_glue`, an EGL OpenGL ES 3.0
 context, keys, gamepads and touch from the input queue, and AAudio. The
-APK has no Java code. It needs Android 8.0 (API 26) or later, on arm64
-or x86_64.
+APK has no Java code. It needs Android 8.0 (API 26) or later and OpenGL
+ES 3.0. The default APK includes 32-bit ARM (`armeabi-v7a`), 64-bit ARM
+(`arm64-v8a`) and x86_64 native libraries. The 32-bit ARM build also
+supports devices with a 64-bit processor but a 32-bit Android userspace.
 
 ## Build
 
@@ -23,6 +25,21 @@ make android            # build-android/ignition.apk
 make android-install    # adb install
 make android-clean
 ```
+
+To build only one ABI, set `ABIS`, for example:
+
+```sh
+ABIS=armeabi-v7a make android
+```
+
+The APK architecture check runs without a device:
+
+```sh
+python3 -m unittest discover -s tests -p test_android_apk.py -v
+```
+
+Run it after a default build; it checks that all three native libraries
+are present and have the expected ELF architecture.
 
 The version comes from the `VERSION` file, or from the argument to
 `build.sh`. It sets `versionName` and `versionCode`: 0.1.0 is code 100.

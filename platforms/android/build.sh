@@ -21,7 +21,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 OUT=$ROOT/build-android
 VERSION=${1:-$(cat "$ROOT/VERSION")}
-ABIS=${ABIS:-"arm64-v8a x86_64"}
+ABIS=${ABIS:-"armeabi-v7a arm64-v8a x86_64"}
 MIN_SDK=26
 TARGET_SDK=34
 

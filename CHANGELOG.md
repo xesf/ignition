@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- The default Android APK includes 32-bit ARM (`armeabi-v7a`), including TVs and other devices with a 32-bit Android userspace.
+
 ## [0.2.0] - 2026-10-24
 
 The Vita becomes playable, championships play through, and NATIVE's

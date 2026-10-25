@@ -195,7 +195,7 @@ web-serve: web
 web-clean:
 	rm -rf build-web
 
-# Android: build-android/ignition.apk (arm64-v8a and x86_64). Needs
+# Android: build-android/ignition.apk (armeabi-v7a, arm64-v8a and x86_64). Needs
 # ANDROID_HOME with an NDK, build-tools and a platform, and a JDK; see
 # platforms/android/README.md.
 android:
