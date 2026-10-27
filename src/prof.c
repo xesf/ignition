@@ -15,6 +15,7 @@ static const char *const s_names[PROF_PARTS] = {
 };
 
 static double s_start[PROF_PARTS], s_total[PROF_PARTS], s_since;
+static uint64_t s_count[PROF_COUNTERS];
 static int s_frames;
 
 static double now_ms(void)
@@ -35,6 +36,11 @@ void prof_end(int part)
     s_total[part] += now_ms() - s_start[part];
 }
 
+void prof_count(int counter, uint64_t amount)
+{
+    s_count[counter] += amount;
+}
+
 void prof_frame(void)
 {
     double t = now_ms();
@@ -50,7 +56,15 @@ void prof_frame(void)
             s_total[i] = 0.0;
         }
         printf("\n");
+        printf("prof-counts: copies %.1f pixels %.1f draws %.1f upload-bytes %.1f\n",
+               (double)s_count[PROF_COPY_CALLS] / s_frames,
+               (double)s_count[PROF_COPY_PIXELS] / s_frames,
+               (double)s_count[PROF_DRAW_CALLS] / s_frames,
+               (double)s_count[PROF_UPLOAD_BYTES] / s_frames);
         fflush(stdout);
+        for (i = 0; i < PROF_COUNTERS; i++) {
+            s_count[i] = 0;
+        }
         s_frames = 0;
         s_since = t;
     }

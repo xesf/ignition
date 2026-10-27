@@ -11,6 +11,7 @@
  * work goes through rnd.h.
  */
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,20 @@
 #include "prof.h"
 #include "rnd.h"
 #include "soft3d/soft3d.h"
+
+#if defined(IGN_GLES) && defined(__ANDROID__) && defined(IGN_GLES_DYN_ARENA) && \
+    IGN_GLES_DYN_ARENA == 1
+#define IGN_DYN_ARENA 1
+#else
+#define IGN_DYN_ARENA 0
+#endif
+
+#if defined(IGN_GLES) && defined(__ANDROID__) && defined(IGN_GLES_VISIBILITY_CULL) && \
+    IGN_GLES_VISIBILITY_CULL == 1
+#define IGN_VISIBILITY_CULL 1
+#else
+#define IGN_VISIBILITY_CULL 0
+#endif
 
 enum {
     MAX_MESHES = 1024,
@@ -41,6 +56,10 @@ struct mesh_entry {
     int first;
     int count;
     int deferred;               /* has faces through a table */
+#if IGN_VISIBILITY_CULL
+    float lo[3], hi[3];         /* uploaded positions, for the draw cull */
+    int bounds_valid;
+#endif
 };
 
 struct texture_entry {
@@ -81,6 +100,10 @@ struct dyn {
     float depth;                /* w of the middle, for the order */
     unsigned tex;
     const u8 *table;            /* NULL: drawn as it is */
+#if IGN_SHARED_PAGES_BUILD
+    unsigned pool_tex;          /* 0: use tex */
+    int pool_layer;
+#endif
 };
 
 static struct dyn s_dyns[MAX_DYN];
@@ -91,6 +114,19 @@ static struct { const s32 *begin, *end; } s_dyn_ranges[8];    /* meshes always d
 static int s_dyn_range_count;
 static unsigned s_dyn_dst;      /* RG8, a copy of the target */
 static int s_dyn_dst_w, s_dyn_dst_h;
+
+#if IGN_SHARED_PAGES_BUILD
+struct page_source {
+    const u8 *pixels;
+    int pages;
+    int base;                   /* -1: this source is not pooled */
+};
+
+static struct page_source s_page_sources[MAX_TEXTURES];
+static int s_page_source_count, s_page_used, s_page_layers;
+static unsigned s_page_tex;
+static int s_page_tried;
+#endif
 
 static unsigned table_get(const u8 *table);
 static unsigned texture_get(int slot);
@@ -314,7 +350,14 @@ static int layer_of(int i, int through_table)
             }
         }
     }
+#if defined(__vita__) || defined(IGN_GXM)
+    /* GXM: each layer costs a scene, so keep the upstream cap. */
     s_layers[i] = through_table && best < MAX_LAYER ? best + 1 : best;
+#else
+    /* Android GLES: the layer copies are the fallback that preserves the
+     * table faces' dependencies, so do not merge them above MAX_LAYER. */
+    s_layers[i] = through_table ? best + 1 : best;
+#endif
     for (y = cy0; y <= cy1; y++) {
         for (x = cx0; x <= cx1; x++) {
             if (s_nodes_n == s_nodes_cap) {
@@ -375,6 +418,150 @@ static void warn_once(int type)
         fprintf(stderr, "gl3d: face type %d not drawn yet\n", type);
     }
 }
+
+#if IGN_VISIBILITY_CULL
+/* GLSL does not promise the CPU's association of a mat4 * vec4, nor
+ * forbid contraction into an FMA. This envelope assumes ordinary IEEE
+ * binary32 with round-to-nearest, FMA allowed, and optionally FTZ; it
+ * does not cover arbitrary-precision arithmetic. 2^-24 is float's unit
+ * roundoff, and eight covers every product and addition of any
+ * association with room for a fused multiply-add. The bound is absolute,
+ * from the sum of the term magnitudes, so it also survives cancellation.
+ * Eight FLT_MIN cover a flushed product or addition result at each of
+ * the four products and three additions. */
+#define CLIP_DOT_UNIT 5.9604644775390625e-8
+#define CLIP_DOT_ROUNDINGS 8.0
+#define CLIP_DOT_FTZ_ALLOWANCE (8.0 * (double)FLT_MIN)
+
+/* A flushed subnormal input may lose far more than its own magnitude
+ * after multiplication by a large position, so it is outside the bound.
+ * An s32 upload never produces a subnormal position, but direct bounds
+ * are checked as well. */
+static int clip_value_uncertain(float v)
+{
+    return !isfinite(v) || (v != 0.0f && fabsf(v) < FLT_MIN);
+}
+
+static int clip_inputs_uncertain(const struct mesh_entry *e, const float m[16])
+{
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        if (clip_value_uncertain(m[i])) {
+            return 1;
+        }
+    }
+    for (i = 0; i < 3; i++) {
+        if (clip_value_uncertain(e->lo[i]) || clip_value_uncertain(e->hi[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* One row of m * (px, py, pz, 1) as the exact double sum, with a bound
+ * on how far any float evaluation of that row can differ from it. */
+static double clip_dot(const float m[16], int row, float px, float py, float pz,
+                       float *error)
+{
+    double p0 = (double)m[row] * px;
+    double p1 = (double)m[4 + row] * py;
+    double p2 = (double)m[8 + row] * pz;
+    double p3 = (double)m[12 + row];
+    double sum = fabs(p0) + fabs(p1) + fabs(p2) + fabs(p3);
+
+    /* Any float product or association can overflow once the absolute
+     * terms sum above FLT_MAX, even when the relative error is finite.
+     * A sum below FLT_MAX is not enough either: rounded products or a
+     * different association can land above it, so the error must fit as
+     * headroom too. */
+    {
+        double allowance = CLIP_DOT_ROUNDINGS * CLIP_DOT_UNIT * sum
+                         + CLIP_DOT_FTZ_ALLOWANCE;
+
+        *error = sum > FLT_MAX || sum + allowance > FLT_MAX
+               ? INFINITY : (float)allowance;
+    }
+    return p0 + p1 + p2 + p3;
+}
+
+/* The enclosing box of the positions actually in the mesh's FLOATS8
+ * upload. A mesh whose build produced no triangles has no usable box. */
+static void mesh_bounds(const float *verts, int n, struct mesh_entry *e)
+{
+    int i, k;
+
+    e->bounds_valid = n > 0;
+    if (!e->bounds_valid) {
+        return;
+    }
+    for (k = 0; k < 3; k++) {
+        e->lo[k] = verts[k];
+        e->hi[k] = verts[k];
+    }
+    for (i = 1; i < n; i++) {
+        for (k = 0; k < 3; k++) {
+            float p = verts[(size_t)i * FLOATS + k];
+
+            e->lo[k] = p < e->lo[k] ? p : e->lo[k];
+            e->hi[k] = p > e->hi[k] ? p : e->hi[k];
+        }
+    }
+}
+
+/* Whether any clip side has every corner of the uploaded box outside
+ * it. Near-plane and behind-eye cases stay: only the four side planes
+ * can reject a box without relying on the depth convention. */
+static int mesh_visible(const struct mesh_entry *e, const float m[16])
+{
+    double corner[8][3];
+    float error[8][3];
+    int i, side, x, y, z;
+
+    if (!e->bounds_valid || clip_inputs_uncertain(e, m)) {
+        return 1;
+    }
+    i = 0;
+    for (x = 0; x < 2; x++) {
+        for (y = 0; y < 2; y++) {
+            for (z = 0; z < 2; z++) {
+                float px = x ? e->hi[0] : e->lo[0];
+                float py = y ? e->hi[1] : e->lo[1];
+                float pz = z ? e->hi[2] : e->lo[2];
+
+                corner[i][0] = clip_dot(m, 0, px, py, pz, &error[i][0]);
+                corner[i][1] = clip_dot(m, 1, px, py, pz, &error[i][1]);
+                corner[i][2] = clip_dot(m, 3, px, py, pz, &error[i][2]);
+                if (!isfinite(error[i][0]) || !isfinite(error[i][1])
+                    || !isfinite(error[i][2])
+                    || corner[i][2] <= (double)error[i][2]) {
+                    return 1;
+                }
+                i++;
+            }
+        }
+    }
+    for (side = 0; side < 4; side++) {
+        int outside = 1;
+
+        for (i = 0; i < 8; i++) {
+            double k = side == 0 ? corner[i][0] : side == 1 ? -corner[i][0]
+                    : side == 2 ? corner[i][1] : -corner[i][1];
+            double margin = (double)(side < 2 ? error[i][0] : error[i][1])
+                          + (double)error[i][2];
+
+            if (!(k > corner[i][2] + margin)) {
+                outside = 0;
+                break;
+            }
+        }
+        if (outside) {
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
 
 /* A mesh's faces as triangles into `verts`; returns their vertices. */
 static int mesh_build(const s32 *mesh, float *verts, int *deferred_out)
@@ -442,6 +629,9 @@ static struct mesh_entry *mesh_get(const s32 *mesh)
         free(verts);
         return NULL;
     }
+#if IGN_VISIBILITY_CULL
+    mesh_bounds(verts, n, &s_meshes[s_mesh_count]);
+#endif
     rnd_mesh_write(s_vbo_used, n, verts);
     free(verts);
     e = &s_meshes[s_mesh_count++];
@@ -472,6 +662,9 @@ void gl3d_mesh_changed(const s32 *mesh)
     n = mesh_build(mesh, verts, &deferred);
     if (n == s_meshes[i].count) {
         rnd_mesh_write(s_meshes[i].first, n, verts);
+#if IGN_VISIBILITY_CULL
+        mesh_bounds(verts, n, &s_meshes[i]);
+#endif
     }
     free(verts);
 }
@@ -503,6 +696,101 @@ static unsigned texture_get(int slot)
     return e->tex;
 }
 
+#if IGN_SHARED_PAGES_BUILD
+
+/* A face may move to the shared array only when every vertex reads a
+ * whole layer of its own source array. */
+static int page_exact(const struct dyn *d, int pages)
+{
+    int k;
+
+    if (pages <= 0) {
+        return 0;
+    }
+    for (k = 0; k < d->count; k++) {
+        float page = d->v[k][6];
+
+        if (!(page >= 0.0f && page < (float)pages) || floorf(page) != page) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static unsigned page_texture(void)
+{
+    if (!s_page_tried) {
+        s_page_tried = 1;
+        s_page_tex = rnd_page_pool_create(&s_page_layers);
+    }
+    return s_page_tex;
+}
+
+/* The layer where an admitted source starts, uploading it once. A source
+ * that cannot be pooled stays out of the array, leaving its faces on
+ * their original one. */
+static int page_source(const u8 *pixels, int pages, int *base)
+{
+    struct page_source *e;
+    int i;
+
+    if (pixels == NULL || pages <= 0) {
+        return 0;
+    }
+    for (i = 0; i < s_page_source_count; i++) {
+        if (s_page_sources[i].pixels == pixels && s_page_sources[i].pages == pages) {
+            *base = s_page_sources[i].base;
+            return s_page_sources[i].base >= 0;
+        }
+    }
+    if (page_texture() == 0 || s_page_source_count == MAX_TEXTURES) {
+        return 0;
+    }
+    e = &s_page_sources[s_page_source_count++];
+    e->pixels = pixels;
+    e->pages = pages;
+    e->base = -1;
+    if (pages > s_page_layers - s_page_used) {
+        return 0;
+    }
+    e->base = s_page_used;
+    if (!rnd_page_pool_upload(s_page_tex, e->base, pixels, pages)) {
+        e->base = -1;
+        return 0;
+    }
+    s_page_used += pages;
+    *base = e->base;
+    return 1;
+}
+
+static void pages_reset(void)
+{
+    if (s_page_tex != 0) {
+        rnd_page_pool_release(s_page_tex);
+    }
+    s_page_tex = 0;
+    s_page_layers = s_page_used = s_page_source_count = 0;
+    s_page_tried = 0;
+}
+
+static void pool_face(struct dyn *d, int slot, int all)
+{
+    int base;
+
+    if (!all || !rnd_dyn_framebuffer_fetch()) {
+        return;
+    }
+    if (d->tex == 0 || !page_exact(d, g_scene_texture_pages[slot])) {
+        return;
+    }
+    if (page_source(g_scene_textures[slot], g_scene_texture_pages[slot], &base)) {
+        d->pool_tex = s_page_tex;
+        d->pool_layer = base;
+    }
+}
+
+#endif
+
 void gl3d_flush(void)
 {
     int i;
@@ -510,6 +798,9 @@ void gl3d_flush(void)
     if (!s_ready) {
         return;
     }
+#if IGN_SHARED_PAGES_BUILD
+    pages_reset();
+#endif
     for (i = 0; i < s_texture_count; i++) {
         rnd_texture_free(s_textures[i].tex);
     }
@@ -789,6 +1080,10 @@ static void collect(const struct scene *sc, const struct scene_obj *o, const flo
         }
         d->tex = tex;
         d->table = NULL;
+#if IGN_SHARED_PAGES_BUILD
+        d->pool_tex = 0;
+        d->pool_layer = 0;
+#endif
         if (type == 1 || type == 2) {
             float h = type == 1 ? 0.5f : 1.0f, uv[4] = { 0, 0, 0, 0 };
 
@@ -904,6 +1199,9 @@ static void collect(const struct scene *sc, const struct scene_obj *o, const flo
             warn_once(type);
             continue;
         }
+#if IGN_SHARED_PAGES_BUILD
+        pool_face(d, o->tex, all);
+#endif
         s_dyn_count++;
     }
 }
@@ -918,6 +1216,40 @@ static int dyn_far_first(const void *a, const void *b)
     }
     return p < q ? -1 : p > q ? 1 : 0;
 }
+
+#if IGN_VISIBILITY_CULL
+/* A face is rejected only when every vertex is strictly outside one of
+ * the four side planes. Behind the eye, touching or crossing a plane,
+ * and non-finite clip coordinates keep it. */
+static int dyn_visible(const struct dyn *d)
+{
+    int side, k;
+
+    for (side = 0; side < 4; side++) {
+        int outside = 1;
+
+        for (k = 0; k < d->count; k++) {
+            float x = d->v[k][0], y = d->v[k][1], w = d->v[k][3];
+            float value, margin;
+
+            if (!isfinite(x) || !isfinite(y) || !isfinite(w) || w <= 0.0f) {
+                outside = 0;
+                break;
+            }
+            value = side == 0 ? x : side == 1 ? -x : side == 2 ? y : -y;
+            margin = 1e-4f * (fabsf(value) + fabsf(w) + 1.0f);
+            if (!(value > w + margin)) {
+                outside = 0;
+                break;
+            }
+        }
+        if (outside) {
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
 
 /* The pixels a face covers, from its clip space vertices. */
 static int dyn_rect(const struct dyn *d, int r[4])
@@ -956,13 +1288,39 @@ static int dyn_rect(const struct dyn *d, int r[4])
 static float *s_batch;
 static int s_batch_cap;
 
+static unsigned batch_texture(const struct dyn *d)
+{
+#if IGN_SHARED_PAGES_BUILD
+    if (d->pool_tex != 0) {
+        return d->pool_tex;
+    }
+#endif
+    return d->tex;
+}
+
+static int same_batch(const struct dyn *a, const struct dyn *b)
+{
+    return a->table == b->table && batch_texture(a) == batch_texture(b);
+}
+
 static int batch_add(int n, const struct dyn *d)
 {
+#if IGN_SHARED_PAGES_BUILD
+    int i;
+#endif
+
     if (n + d->count > s_batch_cap) {
         s_batch_cap = (n + d->count) * 2;
         s_batch = realloc(s_batch, (size_t)s_batch_cap * DYN_FLOATS * sizeof(float));
     }
     memcpy(s_batch + (size_t)n * DYN_FLOATS, d->v, (size_t)d->count * DYN_FLOATS * sizeof(float));
+#if IGN_SHARED_PAGES_BUILD
+    if (d->pool_tex != 0) {
+        for (i = 0; i < d->count; i++) {
+            s_batch[(size_t)(n + i) * DYN_FLOATS + 6] += (float)d->pool_layer;
+        }
+    }
+#endif
     return n + d->count;
 }
 
@@ -978,20 +1336,186 @@ static void draw_batch(const struct dyn *first, int n)
     }
     rnd_depth(RND_DEPTH_LEQUAL, !use_table);
     rnd_offset(use_table);
-    rnd_texture_unit(0, first->tex);
+    rnd_texture_unit(0, batch_texture(first));
     rnd_uniform(RND_U_USE_TABLE, &u);
     rnd_stream(s_batch, n);
     rnd_draw(RND_TRIANGLES, 0, n);
 }
 
-/* Back to front, each through its table over a copy of what is under
- * it. Where copies are dear, one copy of the whole frame serves the
- * faces after it until one of them covers what was drawn since. */
+#if IGN_DYN_ARENA
+/* A run's place in the pass's one vertex block. */
+struct dyn_run {
+    const struct dyn *first;
+    int at;
+    int count;
+};
+
+static struct dyn_run s_runs[MAX_DYN];
+
+static int batch_reserve(int need)
+{
+    if (need > s_batch_cap) {
+        int cap = need * 2;
+        float *p = realloc(s_batch, (size_t)cap * DYN_FLOATS * sizeof(float));
+
+        if (p == NULL) {
+            return 0;
+        }
+        s_batch = p;
+        s_batch_cap = cap;
+    }
+    return 1;
+}
+
+/* `at` is where the pass's runs so far end; n counts this run. -1 when
+ * the staging block cannot grow; the pass then falls back. */
+static int batch_add_pass(int at, int n, const struct dyn *d)
+{
+    if (!batch_reserve(at + n + d->count)) {
+        return -1;
+    }
+    return batch_add(at + n, d) - at;
+}
+
+/* A run from the pass's already uploaded block. */
+static void draw_batch_at(const struct dyn *first, int at, int n)
+{
+    int use_table = first->table != NULL;
+    float u = (float)use_table;
+
+    if (use_table) {
+        rnd_texture_unit(2, s_dyn_dst);
+        rnd_texture_unit(1, table_get(first->table));
+    }
+    rnd_depth(RND_DEPTH_LEQUAL, !use_table);
+    rnd_offset(use_table);
+    rnd_texture_unit(0, batch_texture(first));
+    rnd_uniform(RND_U_USE_TABLE, &u);
+    rnd_draw(RND_TRIANGLES, at, n);
+}
+
+/* Staging allocation failed: each face streams as before, so none is
+ * dropped and none reads another face's vertices. */
+static void draw_one(const struct dyn *d)
+{
+    int use_table = d->table != NULL;
+    float u = (float)use_table;
+
+    if (use_table) {
+        rnd_texture_unit(2, s_dyn_dst);
+        rnd_texture_unit(1, table_get(d->table));
+    }
+    rnd_depth(RND_DEPTH_LEQUAL, !use_table);
+    rnd_offset(use_table);
+    rnd_texture_unit(0, d->tex);
+    rnd_uniform(RND_U_USE_TABLE, &u);
+    rnd_stream(&d->v[0][0], d->count);
+    rnd_draw(RND_TRIANGLES, 0, d->count);
+}
+#endif
+
+/* Back to front. With framebuffer fetch the table reads the current
+ * target, so faces of one material in that order share a draw and no
+ * copy is made. Otherwise each reads a copy of what is under it; where
+ * copies are dear, one copy of the whole frame serves the faces after
+ * it until one of them covers what was drawn since. */
 static void draw_dyns(void)
 {
     int i, copied = 0, batch = rnd_batch_copies();
 
     if (s_dyn_count == 0) {
+        return;
+    }
+#if IGN_VISIBILITY_CULL
+    /* Admission has already happened: the same first MAX_DYN faces are
+     * considered. Compact in place so equal depths keep their order. */
+    {
+        int kept = 0;
+
+        for (i = 0; i < s_dyn_count; i++) {
+            if (dyn_visible(&s_dyns[i])) {
+                if (kept != i) {
+                    s_dyns[kept] = s_dyns[i];
+                }
+                kept++;
+            }
+        }
+        s_dyn_count = kept;
+    }
+    if (s_dyn_count == 0) {
+        return;
+    }
+#endif
+    /* The faces' order, sorted rather than the faces themselves, which
+     * are big. */
+    prof_begin(PROF_SORT);
+    for (i = 0; i < s_dyn_count; i++) {
+        s_order[i] = &s_dyns[i];
+    }
+    qsort(s_order, (size_t)s_dyn_count, sizeof(s_order[0]), dyn_far_first);
+    prof_end(PROF_SORT);
+    rnd_use(RND_DYN);
+    rnd_cull(RND_CULL_OFF);
+    if (rnd_dyn_framebuffer_fetch()) {
+#if IGN_DYN_ARENA
+        int total = 0, runs = 0, failed = 0;
+
+        for (i = 0; i < s_dyn_count;) {
+            int j, n = 0;
+
+            for (j = i; j < s_dyn_count; j++) {
+                const struct dyn *d = s_order[j];
+
+                if (!same_batch(d, s_order[i])) {
+                    break;
+                }
+                n = batch_add_pass(total, n, d);
+                if (n < 0) {
+                    failed = 1;
+                    break;
+                }
+            }
+            if (failed) {
+                break;
+            }
+            s_runs[runs].first = s_order[i];
+            s_runs[runs].at = total;
+            s_runs[runs].count = n;
+            runs++;
+            total += n;
+            i = j;
+        }
+        if (!failed) {
+            int r;
+
+            rnd_stream_pass(s_batch, total);
+            for (r = 0; r < runs; r++) {
+                draw_batch_at(s_runs[r].first, s_runs[r].at, s_runs[r].count);
+            }
+        } else {
+            for (i = 0; i < s_dyn_count; i++) {
+                draw_one(s_order[i]);
+            }
+        }
+#else
+        for (i = 0; i < s_dyn_count;) {
+            int j, n = 0;
+
+            for (j = i; j < s_dyn_count; j++) {
+                const struct dyn *d = s_order[j];
+
+                if (!same_batch(d, s_order[i])) {
+                    break;
+                }
+                n = batch_add(n, d);
+            }
+            draw_batch(s_order[i], n);
+            i = j;
+        }
+#endif
+        rnd_offset(0);
+        rnd_depth(RND_DEPTH_OFF, 1);
+        s_dyn_count = 0;
         return;
     }
     if (s_dyn_dst == 0 || s_dyn_dst_w != s_w || s_dyn_dst_h != s_h) {
@@ -1002,17 +1526,7 @@ static void draw_dyns(void)
         s_dyn_dst_w = s_w;
         s_dyn_dst_h = s_h;
     }
-    /* The faces' order, sorted rather than the faces themselves, which
-     * are big. */
-    prof_begin(PROF_SORT);
-    for (i = 0; i < s_dyn_count; i++) {
-        s_order[i] = &s_dyns[i];
-    }
-    qsort(s_order, (size_t)s_dyn_count, sizeof(s_order[0]), dyn_far_first);
-    prof_end(PROF_SORT);
     cells_reset(s_w, s_h);
-    rnd_use(RND_DYN);
-    rnd_cull(RND_CULL_OFF);
     if (batch) {
         int *layer = layers_for(s_dyn_count), top = 0, l;
 
@@ -1063,7 +1577,7 @@ static void draw_dyns(void)
                     if (layer[j] != l) {
                         continue;
                     }
-                    if (d->tex != s_order[i]->tex || d->table != s_order[i]->table) {
+                    if (!same_batch(d, s_order[i])) {
                         break;
                     }
                     n = batch_add(n, d);
@@ -1148,6 +1662,13 @@ void gl3d_draw(const struct scene *sc, struct scene_obj *const *objs, int count,
         }
         rnd_use(RND_MESH);
         rnd_texture_unit(0, texture_get(o->tex));
+#if IGN_VISIBILITY_CULL
+        /* texture_get has already run, so the cache fills exactly as the
+         * unculled path would; only this face's own draw is skipped. */
+        if (!mesh_visible(e, m)) {
+            continue;
+        }
+#endif
         rnd_uniform(RND_U_MATRIX, m);
         rnd_draw_mesh(e->first, e->count);
     }

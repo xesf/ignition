@@ -133,12 +133,15 @@ test_sound: tests/test_sound.c $(TEST_OBJ)
 test_soft3d: tests/test_soft3d.c $(TEST_OBJ)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
-test: test_lisa test_menu test_settings test_soft3d test_sound
+test: test_lisa test_menu test_settings test_soft3d test_sound test-renderer
 	./test_lisa $(BUILD)
 	./test_soft3d
 	./test_menu
 	./test_settings
 	./test_sound
+
+include tests/renderer.mk
+.DEFAULT_GOAL := all
 
 # Extracts each disc image in data/ into data/<image name>/disc/.
 extract: cd_extract
