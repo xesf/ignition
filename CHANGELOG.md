@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-03
+
+Fixes the Linux builds of 0.4.0, which did not link; nothing else changed in them. The 0.4.0 tag has no release.
+
+### Fixed
+- The Linux builds link again: the disc extractor needed the maths library.
+
 ## [0.4.0] - 2026-11-03
 
 The GOG and Steam releases run as they are, with their Ogg Vorbis music; the Vita's menu and races draw faster; and there is an option to draw the race's effects in 3D.
