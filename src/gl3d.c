@@ -17,10 +17,13 @@
 #include <string.h>
 
 #include "canvas.h"
+#include "fx3d.h"
+#include "fx_blend.h"
 #include "gl3d.h"
 #include "prof.h"
 #include "rnd.h"
 #include "soft3d/soft3d.h"
+#include "video.h"
 
 enum {
     MAX_MESHES = 1024,
@@ -81,6 +84,7 @@ struct dyn {
     float depth;                /* w of the middle, for the order */
     unsigned tex;
     const u8 *table;            /* NULL: drawn as it is */
+    int ground;                 /* a particle pass face that lies on the ground */
 };
 
 static struct dyn s_dyns[MAX_DYN];
@@ -91,6 +95,23 @@ static struct { const s32 *begin, *end; } s_dyn_ranges[8];    /* meshes always d
 static int s_dyn_range_count;
 static unsigned s_dyn_dst;      /* RG8, a copy of the target */
 static int s_dyn_dst_w, s_dyn_dst_h;
+
+/* The 3D effects (fx3d.h): the sprites, points, lines and splash faces
+ * of the particle meshes are drawn after everything else into an RGBA
+ * layer that shares the view's depth buffer, blended by the GPU, and
+ * the layer is put over the view when it is shown. Nothing reads the
+ * target. A row table (256 x 1 RGBA) gives each colour index its
+ * premultiplied colour and alpha (fx_blend.h): table 0 the palette's own
+ * colours, 1 the .SHD's, 2 the .PAN's. */
+static struct { const s32 *begin, *end; } s_part_ranges[4];
+static int s_part_range_count;
+static struct dyn s_parts[MAX_DYN];
+static int s_part_count;
+static int s_in_view;           /* drawing into the view's target */
+static struct { unsigned target, color; int w, h; } s_layer;
+static struct { unsigned tex; const u8 *table; } s_rows[3];
+static u8 s_rows_palette[768];
+static int s_rows_valid;
 
 static unsigned table_get(const u8 *table);
 static unsigned texture_get(int slot);
@@ -172,6 +193,12 @@ static int cells_touch(const int r[4], int mark)
  * than MAX_LAYER; one through a table there reads the frame from before
  * that layer, missing the faces drawn under it in the same layer. */
 enum { LCELL = 32, MAX_LAYER = 5 };
+
+/* The raster path (the menu's film, the race's HUD): the film's crash and
+ * smoke scenes pile see-through faces 50 deep or more (median 20 layers),
+ * and each layer is a GPU scene. A face past the cap is left out, as one
+ * drawn from a copy that misses what is under it erases that (a train). */
+enum { MAX_RASTER_LAYER = 16 };
 
 struct geo {
     float x[6], y[6];           /* one or two triangles */
@@ -276,7 +303,7 @@ static int faces_overlap(const struct geo *a, const struct geo *b)
 
 /* Face i's layer (s_geo[i], through a table or not), from the earlier
  * faces it overlaps; then it is entered in the grid. */
-static int layer_of(int i, int through_table)
+static int layer_of(int i, int through_table, int max_layer, int *over)
 {
     const struct geo *g = &s_geo[i];
     int x, y, best = 0;
@@ -314,7 +341,10 @@ static int layer_of(int i, int through_table)
             }
         }
     }
-    s_layers[i] = through_table && best < MAX_LAYER ? best + 1 : best;
+    if (over != NULL) {
+        *over = through_table && best >= max_layer;
+    }
+    s_layers[i] = through_table && best < max_layer ? best + 1 : best;
     for (y = cy0; y <= cy1; y++) {
         for (x = cx0; x <= cx1; x++) {
             if (s_nodes_n == s_nodes_cap) {
@@ -552,6 +582,7 @@ static void target_begin(struct target *t, int w, int h)
 
 void gl3d_begin(int w, int h)
 {
+    s_in_view = 0;
     target_begin(&s_targets[0], w, h);
     s_vw = w;
     s_vh = h;
@@ -564,7 +595,33 @@ void gl3d_begin(int w, int h)
 
 void gl3d_view_begin(int w, int h, double vw, double vh)
 {
+    static const float zero[4] = { 0, 0, 0, 0 };
+
     target_begin(&s_targets[1], w, h);
+    s_in_view = 1;
+    {
+        static int last = -1;
+
+        if (last != fx3d_enabled()) {
+            last = fx3d_enabled();
+            printf("gl3d: effects %s\n", last ? "3D" : "2D");
+        }
+    }
+    if (fx3d_enabled()) {
+        if (s_layer.target == 0 || s_layer.w != w || s_layer.h != h) {
+            if (s_layer.target != 0) {
+                rnd_target_free(s_layer.target);
+                rnd_texture_free(s_layer.color);
+            }
+            s_layer.color = rnd_texture(RND_RGBA8, w, h, NULL, 0);
+            s_layer.target = rnd_target_shared(s_layer.color, s_targets[1].target);
+            s_layer.w = w;
+            s_layer.h = h;
+        }
+        rnd_bind(s_layer.target);
+        rnd_clear(zero, 0);
+        rnd_bind(s_targets[1].target);
+    }
     s_vw = vw;
     s_vh = vh;
 }
@@ -597,6 +654,7 @@ void gl3d_view_resume(void)
     s_w = t->w;
     s_h = t->h;
     s_ox = s_oy = 0;
+    s_in_view = 1;
 }
 
 /* Limits drawing to the view's columns x0..x1 (its virtual columns);
@@ -715,6 +773,40 @@ static int is_dynamic(const s32 *mesh)
     return 0;
 }
 
+void gl3d_set_particles(const s32 *begin, const s32 *end)
+{
+    int i;
+
+    for (i = 0; i < s_part_range_count; i++) {
+        if (s_part_ranges[i].begin == begin) {
+            s_part_ranges[i].end = end;
+            return;
+        }
+    }
+    if (s_part_range_count < 4) {
+        s_part_ranges[s_part_range_count].begin = begin;
+        s_part_ranges[s_part_range_count].end = end;
+        s_part_range_count++;
+    }
+}
+
+static int is_particle(const s32 *mesh)
+{
+    int i;
+
+    for (i = 0; i < s_part_range_count; i++) {
+        if (mesh >= s_part_ranges[i].begin && mesh < s_part_ranges[i].end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int particles_on(void)
+{
+    return s_in_view && fx3d_enabled();
+}
+
 static void clip_of(const float m[16], const s32 *v, float c[4])
 {
     int k;
@@ -761,14 +853,14 @@ static void dyn_box(struct dyn *d, const float c[4], float hx, float hy, const f
  * rasteriser places them on the screen (8.8 sprite sizes of 0x44d0f0
  * and 0x44d230 through 0x455648's box). */
 static void collect(const struct scene *sc, const struct scene_obj *o, const float m[16],
-                    int all)
+                    int all, int particle)
 {
     const s32 *mesh = o->mesh;
     const u8 *f = (const u8 *)(mesh + 2 + 3 * mesh[0]);
     unsigned tex = 0;
     int i, have_tex = 0;
 
-    for (i = 0; i < mesh[1] && s_dyn_count < MAX_DYN; i++) {
+    for (i = 0; i < mesh[1] && s_dyn_count < MAX_DYN && s_part_count < MAX_DYN; i++) {
         const s32 *w = (const s32 *)f;
         int type = (s8)f[0], size = face_size(type);
         struct dyn *d = &s_dyns[s_dyn_count];
@@ -904,7 +996,14 @@ static void collect(const struct scene *sc, const struct scene_obj *o, const flo
             warn_once(type);
             continue;
         }
-        s_dyn_count++;
+        /* With 3D effects every face through a table (shadows, skid
+         * marks, glass too) is blended by the GPU. */
+        if (particle || (d->table != NULL && particles_on())) {
+            d->ground = !particle;
+            s_parts[s_part_count++] = *d;
+        } else {
+            s_dyn_count++;
+        }
     }
 }
 
@@ -1040,7 +1139,7 @@ static void draw_dyns(void)
                 g->x[k] = (d->v[k][0] / w + 1.0f) * 0.5f * s_w;
                 g->y[k] = (d->v[k][1] / w + 1.0f) * 0.5f * s_h;
             }
-            layer_of(i, d->table != NULL);
+            layer_of(i, d->table != NULL, MAX_LAYER, NULL);
             top = layer[i] > top ? layer[i] : top;
         }
         prof_end(PROF_LAYERS);
@@ -1115,6 +1214,88 @@ static void draw_dyns(void)
     s_dyn_count = 0;
 }
 
+/* The row tables for the palette as it is now. */
+static void rows_update(void)
+{
+    const u8 *tables[3] = { NULL, s_tables_shd, s_tables_fixed };
+    int i, changed = !s_rows_valid || memcmp(s_rows_palette, g_video_palette, 768) != 0;
+
+    for (i = 0; i < 3; i++) {
+        u8 rows[256 * 4];
+
+        if (s_rows[i].tex != 0 && !changed && s_rows[i].table == tables[i]) {
+            continue;
+        }
+        fx_blend_rows(tables[i], g_video_palette, rows);
+        if (s_rows[i].tex == 0) {
+            s_rows[i].tex = rnd_texture(RND_RGBA8, 256, 1, rows, 256);
+        } else {
+            rnd_texture_set(s_rows[i].tex, 256, 1, rows, 256);
+        }
+        s_rows[i].table = tables[i];
+    }
+    memcpy(s_rows_palette, g_video_palette, 768);
+    s_rows_valid = 1;
+}
+
+static unsigned rows_for(const u8 *table)
+{
+    return table == NULL ? s_rows[0].tex : table == s_tables_shd ? s_rows[1].tex : s_rows[2].tex;
+}
+
+/* The particles into the layer, far to near, blended; the view is
+ * bound again after. */
+static void draw_particles(void)
+{
+    int i;
+
+    if (s_part_count == 0) {
+        return;
+    }
+    if (s_layer.target == 0) {
+        s_part_count = 0;
+        return;
+    }
+    rows_update();
+    for (i = 0; i < s_part_count; i++) {
+        s_order[i] = &s_parts[i];
+    }
+    qsort(s_order, (size_t)s_part_count, sizeof(s_order[0]), dyn_far_first);
+    rnd_bind(s_layer.target);
+    rnd_use(RND_PARTICLE);
+    rnd_cull(RND_CULL_OFF);
+    rnd_depth(RND_DEPTH_LEQUAL, 0);
+    rnd_offset(0);
+    rnd_blend(RND_BLEND_PREMUL);
+    for (i = 0; i < s_part_count;) {
+        const struct dyn *first = s_order[i];
+        int n = 0;
+
+        while (i < s_part_count && s_order[i]->tex == first->tex
+               && s_order[i]->table == first->table && s_order[i]->ground == first->ground) {
+            n = batch_add(n, s_order[i]);
+            i++;
+        }
+        /* Faces that lie on the ground are pulled toward the eye, as
+         * the 2D path does. */
+        rnd_offset(first->ground);
+        rnd_texture_unit(0, first->tex);
+        rnd_texture_unit(1, rows_for(first->table));
+        rnd_stream(s_batch, n);
+        rnd_draw(RND_TRIANGLES, 0, n);
+    }
+    rnd_blend(RND_BLEND_OFF);
+    rnd_offset(0);
+    rnd_depth(RND_DEPTH_OFF, 1);
+    rnd_bind(s_targets[1].target);
+    s_part_count = 0;
+}
+
+unsigned gl3d_particle_texture(void)
+{
+    return s_layer.color;
+}
+
 void gl3d_draw(const struct scene *sc, struct scene_obj *const *objs, int count, double ox,
                double oy)
 {
@@ -1132,7 +1313,7 @@ void gl3d_draw(const struct scene *sc, struct scene_obj *const *objs, int count,
 
         if (is_dynamic(o->mesh)) {
             object_matrix(sc, o, ox, oy, m);
-            collect(sc, o, m, 1);
+            collect(sc, o, m, 1, particles_on() && is_particle(o->mesh));
             continue;
         }
         e = mesh_get(o->mesh);
@@ -1141,7 +1322,7 @@ void gl3d_draw(const struct scene *sc, struct scene_obj *const *objs, int count,
         }
         object_matrix(sc, o, ox, oy, m);
         if (e->deferred) {
-            collect(sc, o, m, 0);
+            collect(sc, o, m, 0, 0);
         }
         if (e->count == 0) {
             continue;
@@ -1155,7 +1336,12 @@ void gl3d_draw(const struct scene *sc, struct scene_obj *const *objs, int count,
     rnd_depth(RND_DEPTH_OFF, 1);
     prof_end(PROF_MESHES);
     prof_begin(PROF_DYNS);
+    prof_begin(PROF_D_DYNS);
     draw_dyns();
+    prof_end(PROF_D_DYNS);
+    prof_begin(PROF_D_PART);
+    draw_particles();
+    prof_end(PROF_D_PART);
     prof_end(PROF_DYNS);
 }
 
@@ -1360,6 +1546,7 @@ void gl3d_raster(u8 *target, int w, int h, int pitch, const struct raster_cmd *c
         /* The cells take in NATIVE's margins, which the faces reach. */
         int *layer = layers_for(count), top = 0, l;
         int mx = (int)ceilf(off[0]), my = (int)ceilf(off[1]);
+        unsigned char *dropped = calloc((size_t)count, 1);
 
         grid_reset(w + 2 * mx, h + 2 * my);
         for (i = 0; i < count; i++) {
@@ -1376,8 +1563,16 @@ void gl3d_raster(u8 *target, int w, int h, int pitch, const struct raster_cmd *c
                 g->x[k] = cmds[i].x[k];
                 g->y[k] = cmds[i].y[k];
             }
-            layer_of(i, !cmd_opaque(&cmds[i]));
-            top = layer[i] > top ? layer[i] : top;
+            {
+                int over;
+
+                layer_of(i, !cmd_opaque(&cmds[i]), MAX_RASTER_LAYER, &over);
+                top = layer[i] > top ? layer[i] : top;
+                if (over) {
+                    /* Not drawn: a copy for it would miss what is under it. */
+                    dropped[i] = 1;
+                }
+            }
         }
         for (l = 0; l <= top; l++) {
             if (l > 0) {
@@ -1393,7 +1588,7 @@ void gl3d_raster(u8 *target, int w, int h, int pitch, const struct raster_cmd *c
             }
             for (i = 0; i < count; i += run) {
                 run = 1;
-                if (layer[i] != l) {
+                if (layer[i] != l || dropped[i]) {
                     continue;
                 }
                 if (cmd_opaque(&cmds[i])) {
@@ -1406,6 +1601,7 @@ void gl3d_raster(u8 *target, int w, int h, int pitch, const struct raster_cmd *c
                 rnd_draw(RND_TRIANGLES, i * 3, run * 3);
             }
         }
+        free(dropped);
         if (!gpu) {
             rnd_read(0, 0, w, h, RND_R8, target, pitch);
         }
@@ -1479,6 +1675,7 @@ int gl3d_surface_begin(u8 *key, int lw, int lh)
     if (canvas_bind(key, &pw, &ph, 1) == 0) {
         return 0;
     }
+    s_in_view = 0;
     {
         float mx, my;
 

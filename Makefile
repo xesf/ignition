@@ -40,14 +40,14 @@ endif
 
 # The original's software 3D (--soft3d).
 SOFT3D_SRC := $(wildcard $(SRCDIR)/soft3d/*.c)
-CORE_SRC := $(SRCDIR)/app.c $(SRCDIR)/game.c $(SRCDIR)/stubs.c $(SRCDIR)/net.c $(SRCDIR)/dplay.c $(SRCDIR)/canvas.c $(SRCDIR)/scene.c $(SRCDIR)/gl3d.c $(SRCDIR)/menu/car.c $(SRCDIR)/menu/bg.c $(SRCDIR)/race/load.c $(SRCDIR)/race/track.c $(SRCDIR)/race/world.c $(SRCDIR)/race/cars.c $(SRCDIR)/phys.c $(SRCDIR)/race/phys.c $(SRCDIR)/anim_tex.c $(SRCDIR)/race/ai.c $(SRCDIR)/srf.c $(SRCDIR)/race/contact.c $(SRCDIR)/race/fx.c $(SRCDIR)/race/respawn.c $(SRCDIR)/race/camera.c $(SRCDIR)/race/view.c $(SRCDIR)/race/misc.c $(SRCDIR)/race/hud.c $(SRCDIR)/race/results.c $(SRCDIR)/race/sound.c $(SRCDIR)/race/control.c $(SRCDIR)/race/init.c $(SRCDIR)/race/race.c $(SRCDIR)/race/frame_stubs.c $(SRCDIR)/race/input.c $(SRCDIR)/race/data.c $(SRCDIR)/race/debug.c \
+CORE_SRC := $(SRCDIR)/app.c $(SRCDIR)/game.c $(SRCDIR)/stubs.c $(SRCDIR)/net.c $(SRCDIR)/dplay.c $(SRCDIR)/canvas.c $(SRCDIR)/scene.c $(SRCDIR)/gl3d.c $(SRCDIR)/fx_blend.c $(SRCDIR)/menu/car.c $(SRCDIR)/menu/bg.c $(SRCDIR)/race/load.c $(SRCDIR)/race/track.c $(SRCDIR)/race/world.c $(SRCDIR)/race/cars.c $(SRCDIR)/phys.c $(SRCDIR)/race/phys.c $(SRCDIR)/anim_tex.c $(SRCDIR)/race/ai.c $(SRCDIR)/srf.c $(SRCDIR)/race/contact.c $(SRCDIR)/race/fx.c $(SRCDIR)/race/respawn.c $(SRCDIR)/race/camera.c $(SRCDIR)/race/view.c $(SRCDIR)/race/misc.c $(SRCDIR)/race/hud.c $(SRCDIR)/race/results.c $(SRCDIR)/race/sound.c $(SRCDIR)/race/control.c $(SRCDIR)/race/init.c $(SRCDIR)/race/race.c $(SRCDIR)/race/frame_stubs.c $(SRCDIR)/race/input.c $(SRCDIR)/race/data.c $(SRCDIR)/race/debug.c \
             $(SRCDIR)/lisa/lisa.c $(SRCDIR)/lisa/log.c $(SRCDIR)/lisa/mem.c $(SRCDIR)/lisa/file.c \
             $(SRCDIR)/lisa/exit.c $(SRCDIR)/lisa/gfx.c $(SRCDIR)/lisa/texture.c $(SRCDIR)/lisa/sprite.c $(SRCDIR)/lisa/turned.c \
             $(SRCDIR)/lisa/font.c $(SRCDIR)/startup.c $(SRCDIR)/input.c \
             $(SRCDIR)/menu/engine.c $(SRCDIR)/menu/data.c $(SRCDIR)/settings.c $(SRCDIR)/frontend/frontend.c $(SRCDIR)/frontend/state.c \
             $(SRCDIR)/menu/panels.c $(SRCDIR)/menu/pages.c $(SRCDIR)/audio.c $(SRCDIR)/cd.c $(SRCDIR)/sound.c $(SRCDIR)/cdp.c \
             $(SRCDIR)/video.c $(SRCDIR)/gfx.c $(SRCDIR)/rnd_gl.c $(SRCDIR)/vfs.c $(SRCDIR)/main.c \
-            $(SRCDIR)/cdimage.c $(SRCDIR)/prof.c $(SOFT3D_SRC)
+            $(SRCDIR)/cdimage.c $(SRCDIR)/vorbis.c $(SRCDIR)/prof.c $(SOFT3D_SRC)
 
 WARN := -Wall -Wextra -Wno-unused-parameter
 
@@ -112,8 +112,8 @@ $(BUILD)/%.o: $(SRCDIR)/%.m $(wildcard $(SRCDIR)/*.h $(SRCDIR)/*/*.h)
 	@mkdir -p $(dir $@)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
 
-$(CD_EXTRACT): tools/cd_extract.c $(SRCDIR)/cdimage.c $(SRCDIR)/cdimage.h
-	$(CC) $(TOOL_CFLAGS) tools/cd_extract.c $(SRCDIR)/cdimage.c -o $@
+$(CD_EXTRACT): tools/cd_extract.c $(SRCDIR)/cdimage.c $(SRCDIR)/vorbis.c $(SRCDIR)/cdimage.h
+	$(CC) $(TOOL_CFLAGS) tools/cd_extract.c $(SRCDIR)/cdimage.c $(SRCDIR)/vorbis.c -o $@
 
 # The engine without main.c, for tests.
 TEST_OBJ := $(filter-out $(BUILD)/main.o,$(CORE_OBJ)) $(HOST_OBJ)
@@ -133,7 +133,11 @@ test_sound: tests/test_sound.c $(TEST_OBJ)
 test_soft3d: tests/test_soft3d.c $(TEST_OBJ)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 
-test: test_lisa test_menu test_settings test_soft3d test_sound
+test_fx_blend: tests/test_fx_blend.c $(SRCDIR)/fx_blend.c
+	$(CC) $(CFLAGS) $^ -lm -o $@
+
+test: test_lisa test_menu test_settings test_soft3d test_sound test_fx_blend
+	./test_fx_blend
 	./test_lisa $(BUILD)
 	./test_soft3d
 	./test_menu
@@ -142,7 +146,7 @@ test: test_lisa test_menu test_settings test_soft3d test_sound
 
 # Extracts each disc image in data/ into data/<image name>/disc/.
 extract: cd_extract
-	@for cue in data/*/*.cue; do \
+	@for cue in data/*/*.cue data/*/*/*.cue; do \
 		./cd_extract "$$cue" "$$(dirname "$$cue")/disc" || exit 1; \
 	done
 
@@ -259,4 +263,4 @@ vita-clean:
 	rm -rf $(VBUILD)
 
 clean:
-	rm -rf $(BUILD) $(TARGET) cd_extract test_lisa test_menu test_settings test_soft3d test_sound *.dSYM
+	rm -rf $(BUILD) $(TARGET) cd_extract test_lisa test_menu test_settings test_soft3d test_sound test_fx_blend *.dSYM

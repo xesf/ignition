@@ -311,6 +311,17 @@ static void poll_pad(void)
         return;
     }
     pad_keys(c.buttons, c.lx, c.ly, keys);
+    {
+        /* L and R together (a press, not held): a screenshot. */
+        static int held;
+        int both = (c.buttons & (SCE_CTRL_L1 | SCE_CTRL_LTRIGGER)) != 0
+                   && (c.buttons & (SCE_CTRL_R1 | SCE_CTRL_RTRIGGER)) != 0;
+
+        if (both && !held) {
+            video_request_shot();
+        }
+        held = both;
+    }
     g_plat_sticks[0].present = 1;
     g_plat_sticks[0].x = (c.lx - 128) * 100 / 127;
     g_plat_sticks[0].y = (c.ly - 128) * 100 / 127;

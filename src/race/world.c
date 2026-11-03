@@ -10,6 +10,7 @@
 #include "canvas.h"
 #include "game.h"
 #include "platform/platform.h"
+#include "fx3d.h"
 #include "gl3d.h"
 #include "prof.h"
 #include "lisa/font.h"
@@ -566,6 +567,9 @@ void race_draw_view(const struct scene *sc, struct scene_obj *const *objs, int n
     gl3d_view_end();
     prof_end(PROF_VIEW_END);
     video_set_layer(gl3d_view_texture(), s_clear);
+    if (fx3d_enabled()) {
+        video_set_overlay(gl3d_particle_texture());
+    }
 }
 
 /* Until the view (0x436990) is ported: the chase camera of the car

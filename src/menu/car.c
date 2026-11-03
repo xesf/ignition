@@ -57,6 +57,14 @@ int menucar_load(void)
     fe_4be5dc = 0;
     fe_4be75c = 0;
     fe_4be5f8 = load_whole("baltazar\\data\\test.pfm", &pfm_size);
+    if (fe_4be5f8 == NULL || fe_4be630 == NULL) {
+        /* The GOG and Steam releases (the DOS data) have the shorter film
+         * only: TEST2.PFM, which DEFAULT2.PSQ plays. */
+        free(fe_4be5f8);
+        free(fe_4be630);
+        fe_4be630 = load_whole("baltazar\\data\\default2.psq", &fe_4be630_size);
+        fe_4be5f8 = load_whole("baltazar\\data\\test2.pfm", &pfm_size);
+    }
     menubg_load_pages(fe_4be898);
     menubg_load_shades(fe_4be804);
     if (fe_4be5f8 != NULL) {

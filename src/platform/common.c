@@ -278,31 +278,63 @@ static int try_base(const char *base, char *out, size_t size)
     return has_game(out);
 }
 
-/* The first folder under data/ (in name order) with a disc/ in it: the
- * repository's layout, whatever the disc image's folder is called. */
-static int find_in_repo_data(char *out, size_t n)
+/* The first folder (in name order) with a disc/ in it, under data/ or
+ * one folder down (data/images-disks/<image>/disc): the repository's
+ * layout, whatever the disc image's folder is called. */
+static void best_disc(const char *dir, int depth, char *best, size_t size)
 {
-    DIR *d = opendir("data");
+    DIR *d = opendir(dir);
     struct dirent *e;
-    char best[512] = "", path[1024];
+    char path[1024];
 
     if (d == NULL) {
-        return 0;
+        return;
     }
     while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] == '.') {
             continue;
         }
-        snprintf(path, sizeof(path), "data/%s/disc", e->d_name);
-        if (is_dir(path) && (best[0] == '\0' || strcmp(e->d_name, best) < 0)) {
-            snprintf(best, sizeof(best), "%s", e->d_name);
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        if (!is_dir(path)) {
+            continue;
+        }
+        {
+            char disc[1100];
+
+            snprintf(disc, sizeof(disc), "%s/disc", path);
+            if (is_dir(disc)) {
+                /* By the image's folder, so that "X" comes before "X (Y)". */
+                size_t bl = strlen(best);
+
+                if (best[0] == '\0' || strncmp(path, best, bl > 5 ? bl - 5 : 0) < 0
+                    || (strncmp(path, best, bl > 5 ? bl - 5 : 0) == 0
+                        && strlen(path) < bl - 5)) {
+                    snprintf(best, size, "%s", disc);
+                }
+                continue;
+            }
+        }
+        if (depth > 0) {
+            best_disc(path, depth - 1, best, size);
         }
     }
     closedir(d);
+}
+
+static int find_in_repo_data(char *out, size_t n)
+{
+    char best[1024] = "";
+
+    /* The GOG and Steam releases, copied into data/ as they are. */
+    if (has_game("data")) {
+        snprintf(out, n, "data");
+        return 1;
+    }
+    best_disc("data", 1, best, sizeof(best));
     if (best[0] == '\0') {
         return 0;
     }
-    snprintf(out, n, "data/%s/disc", best);
+    snprintf(out, n, "%s", best);
     return 1;
 }
 

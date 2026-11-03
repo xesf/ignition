@@ -22,6 +22,7 @@ test_menu
 test_settings
 test_sound
 test_soft3d
+test_fx_blend
 build-vita/
 build-linux/
 build-windows/

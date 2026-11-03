@@ -175,6 +175,20 @@ what OpenGL does:
   memory. The Vita build also defines `IGN_PROF`, which adds the race
   frame's parts (`src/prof.h`).
 
+## Effects
+
+With EFFECTS 3D (not the default: on the Vita it has not been faster than 2D), the faces of the effects'
+meshes (`gl3d_set_particles`) skip the layers and copies above. They are
+drawn after the view into an RGBA layer (`gl3d_particle_texture`) that
+shares the view's depth buffer, with the GPU's blend, `src + (1 - a)
+dst`, and the layer is put over the view at the present. Each colour
+index goes through a 256 x 1 table of premultiplied colour and alpha, made
+from the colour table by `fx_blend_rows` (`src/fx_blend.c`). A frame has
+one more scene for each view, however many effects there are.
+
+The `particle` and `layer` programs are new: compile them once on a Vita
+with `libshacccg.suprx` and commit the `.gxp` files (see "Shaders").
+
 ## Not done
 
 - Races drop below 36 frames a second where many see-through faces

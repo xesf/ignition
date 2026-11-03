@@ -11,7 +11,7 @@
 
 static const char *const s_names[PROF_PARTS] = {
     "physics", "cars", "present", "ticks", "gather", "3d", "hud", "3d-meshes", "3d-faces",
-    "3d-end", "view", "3d-layers", "3d-sort", "results", "rows"
+    "3d-end", "view", "3d-layers", "3d-sort", "results", "rows", "p-scene", "p-end", "p-pad", "p-queue", "p-slot", "p-gfx", "g-sync", "g-begin", "g-layers", "h-pal", "h-3d", "h-tex", "h-over", "h-snap", "t-fin", "t-ring", "t-alloc", "t-fill", "d-dyns", "d-part"
 };
 
 static double s_start[PROF_PARTS], s_total[PROF_PARTS], s_since;

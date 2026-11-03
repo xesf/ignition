@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-03
+
+The GOG and Steam releases run as they are, with their Ogg Vorbis music; the Vita's menu and races draw faster; and there is an option to draw the race's effects in 3D.
+
+### Added
+- The GOG and Steam releases work as they are: copy them into `data/` and the game finds the files there, with the CD music decoded from their Ogg Vorbis tracks (`game.ins` lists them; `game.gog` is not needed). Disc images are also found one folder down, such as `data/images-disks/<image>/disc`. Without `TEST.PFM`, which those releases lack, the menu plays the shorter film (`TEST2.PFM`).
+- GFX OPTIONS has an EFFECTS item, 2D or 3D. With 3D, the race's effects (smoke, fire, sparks, splashes, rain and snow), shadows, skid marks and glass are drawn after the 3D into a layer of their own that the GPU blends over the view, instead of reading the pixels under each one. It is 2D by default; `--effects 2d|3d` sets it for one run, and the choice is kept in `ign_port.cfg`.
+- On the Vita, L and R together save a screenshot to `ux0:data/ignition/shotNN.tga`.
+
+### Changed
+- On the Vita the race's 2D picture is shown from the game's own buffer without a copy, and rows that are empty are not compared, which took the frame's present step from 18 ms to about 7 ms.
+- On the Vita the menu's background film (see-through faces drawn in at most 16 layers; one past that is left out) runs at about 45 frames a second through its crash scenes (30 at the worst) instead of 5 when each face copied the screen.
+- The Vita reads the game from `ux0:data/ignition` when the game's files are there, and from `ux0:data/ignition/disc` as before. `make vita-deploy` and the LiveArea art look for a disc under `data/` or one folder down.
+- The stats line the Vita logs has the parts of the frame's present step and the 2D picture's rows.
+
+### Fixed
+- On the Vita, smoke and explosions in the menu's film no longer draw as rectangles that erase the train and cars under them; a few small patches can still show in the biggest explosions.
+- The Vita package has the game's own LiveArea art again when the disc is under `data/images-disks/`.
+
 ## [0.3.0] - 2026-10-25
 
 Network play, a software 3D renderer for the original resolutions,

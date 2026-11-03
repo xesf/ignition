@@ -237,16 +237,19 @@ static void add_native_resolution(void)
 }
 
 /* The port's settings, which ign_win.btz has no room for (the race
- * writes that file at its own size): the renderer, then the music's
- * volume. */
+ * writes that file at its own size): the renderer, the music's volume,
+ * then the effects. */
 #define PORT_SETTINGS "ign_port.cfg"
+
+int g_effects_override = -1;
 
 static void port_settings_save(void)
 {
-    s32 v[2];
+    s32 v[3];
 
     v[0] = settings_get(SET_RENDERER);
     v[1] = settings_get(SET_MUSIC_VOLUME);
+    v[2] = settings_get(SET_EFFECTS);
     file_write(PORT_SETTINGS, v, sizeof(v));
 }
 
@@ -327,22 +330,26 @@ static struct menu_page *page_with(int lang, int offset, int *index)
 }
 
 /* The port's items:
- * - GFX OPTIONS gets RENDERER last: HARDWARE draws the 2D on the GPU,
- *   SOFTWARE on the CPU as the original (the 3D on the GPU), SOFT 3D
- *   the 3D on the CPU too, with the original's pipeline (src/soft3d/).
- *   The page goes up most of a row, so that 320 x 200 holds it.
+ * - GFX OPTIONS gets RENDERER, then EFFECTS last: HARDWARE draws the 2D
+ *   on the GPU, SOFTWARE on the CPU as the original (the 3D on the GPU),
+ *   SOFT 3D the 3D on the CPU too, with the original's pipeline
+ *   (src/soft3d/). EFFECTS is 2D or 3D (SET_EFFECTS). The page goes up
+ *   for the two rows, so that 320 x 200 holds it.
  * - SOUND OPTIONS gets MUSIC VOL. under CD MUSIC, 0 to 10, as SFX
  *   VOLUME, which the original has for the effects alone. */
 static void add_port_options(void)
 {
-    enum { RAISE = 15, MAX_ITEMS = 16 };
+    enum { RAISE = 15, ROW = 19, MAX_ITEMS = 16 };
     static const char *const renderer[3] = { "HARDWARE", "SOFTWARE", "SOFT 3D" };
+    static const char *const effects[2] = { "2D", "3D" };
     static const char *const levels[11] = {
         "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"
     };
     static struct menu_item gfx_items[MENU_LANGUAGES][MAX_ITEMS];
+    static struct menu_item effects_items[MENU_LANGUAGES][MAX_ITEMS];
     static struct menu_item sound_items[MENU_LANGUAGES][MAX_ITEMS];
     static struct menu_visual gfx_visuals[MENU_LANGUAGES][8];
+    static struct menu_visual effects_visuals[MENU_LANGUAGES][6];
     static struct menu_visual music_visuals[MENU_LANGUAGES][24];
     static int done;
     int lang, k;
@@ -370,16 +377,28 @@ static void add_port_options(void)
                 }
             }
             if (pair != NULL) {
+                int raise = RAISE;
+
                 n.offset = SET_RENDERER;
                 n.min = 0;
                 n.max = 2;
                 n.label = "RENDERER";
                 n.names = renderer;
                 n.visuals = gfx_visuals[lang];
-                insert_item(p, gfx_items[lang], p->count, pair, &n, lowest + 19);
+                insert_item(p, gfx_items[lang], p->count, pair, &n, lowest + ROW);
+                if (p->count < MAX_ITEMS) {
+                    n.offset = SET_EFFECTS;
+                    n.min = 0;
+                    n.max = 1;
+                    n.label = "EFFECTS";
+                    n.names = effects;
+                    n.visuals = effects_visuals[lang];
+                    insert_item(p, effects_items[lang], p->count, pair, &n, lowest + 2 * ROW);
+                    raise += ROW;
+                }
                 for (k = 0; k < p->count; k++) {
                     if (p->items[k].value != NULL && p->items[k].visuals != NULL) {
-                        move_item(&p->items[k], -RAISE);
+                        move_item(&p->items[k], -raise);
                     }
                 }
             }
@@ -403,17 +422,24 @@ static void add_port_options(void)
 /* PORT_SETTINGS, or the defaults: the renderer the resolution's (the
  * GPU for NATIVE, the CPU for the original's sizes; --software starts
  * on the CPU and --soft3d with the 3D on it too, whatever is saved),
- * the music at 10. */
+ * the music at 10, the effects 3D on the Vita and 2D elsewhere. A file
+ * of one or two words (from before the effects, or before the music)
+ * keeps the defaults for the words it lacks. --effects overrides the
+ * effects. */
 static void port_settings_load(int resolution)
 {
-    s32 v[2];
+    s32 v[3];
+    int words;
 
     v[0] = resolution == CANVAS_NATIVE ? 0 : 1;
     v[1] = 10;
+    /* 2D everywhere: on the Vita, 3D has not been faster than 2D yet. */
+    v[2] = 0;
     if (file_exists(PORT_SETTINGS) == 1) {
         long size = file_size(PORT_SETTINGS);
 
-        file_read_at(PORT_SETTINGS, v, size >= (long)sizeof(v) ? sizeof(v) : sizeof(v[0]), 0);
+        words = size >= 3 * (long)sizeof(s32) ? 3 : size >= 2 * (long)sizeof(s32) ? 2 : 1;
+        file_read_at(PORT_SETTINGS, v, words * sizeof(s32), 0);
     }
     if (!canvas_hardware() && v[0] == 0) {
         v[0] = 1;
@@ -421,9 +447,13 @@ static void port_settings_load(int resolution)
     if (g_soft3d) {
         v[0] = 2;
     }
+    if (g_effects_override >= 0) {
+        v[2] = g_effects_override;
+    }
     v[0] = v[0] < 0 || v[0] > 2 ? 1 : v[0];
     settings_set(SET_RENDERER, v[0]);
     settings_set(SET_MUSIC_VOLUME, v[1] < 0 ? 0 : v[1] > 10 ? 10 : v[1]);
+    settings_set(SET_EFFECTS, v[2] < 0 ? 0 : v[2] > 1 ? 1 : v[2]);
     g_soft3d = v[0] == 2;
     canvas_set_hardware(v[0] == 0);
     cd_set_music_volume(settings_get(SET_MUSIC_VOLUME));
@@ -474,7 +504,7 @@ void menu_present(void)
     const s32 *mode = g_menu_modes[g_menu_mode_index];
     s32 res = settings_get(SET_RESOLUTION);
 
-    static s32 last_renderer = -1, last_music = -1;
+    static s32 last_renderer = -1, last_music = -1, last_effects = -1;
     static int last_hardware = -1;
     s32 renderer;
 
@@ -513,6 +543,12 @@ void menu_present(void)
             port_settings_save();
         }
         last_music = settings_get(SET_MUSIC_VOLUME);
+    }
+    if (settings_get(SET_EFFECTS) != last_effects) {
+        if (last_effects != -1) {
+            port_settings_save();
+        }
+        last_effects = settings_get(SET_EFFECTS);
     }
     last_hardware = canvas_hardware();
     video_blit(g_menu_screen, mode[0], 0, 0, mode[0], mode[1], 0, 0);

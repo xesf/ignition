@@ -3,7 +3,8 @@
  *
  *   ignition [--data DIR] [--view FILE.PIC] [--text TEXT] [--press MS:KEY]...
  *            [--background] [--shot MS:FILE.TGA] [--cue IMAGE.CUE] [--res N]
- *            [--software] [--soft3d] [--host] [--connect HOST[:PORT]]
+ *            [--software] [--soft3d] [--effects 2d|3d] [--host]
+ *            [--connect HOST[:PORT]]
  *
  * --data is the folder with the game files, the disc root as extracted
  * by `make extract`. --view shows one picture through the renderer, with
@@ -19,8 +20,10 @@
  * window's. --software starts with the 2D drawn on the CPU, as the
  * original did (Alt+R switches). --soft3d draws the 3D on the CPU too,
  * with the original's pipeline and rasteriser (src/soft3d/), at the
- * screen's resolution. --host and --connect choose what NETWORK GAME
- * does (net_set_option). --version prints this port's version.
+ * screen's resolution. --effects 2d|3d sets EFFECTS over the saved
+ * setting, for scripted comparisons (not saved). --host and --connect
+ * choose what NETWORK GAME does (net_set_option). --version prints this
+ * port's version.
  *
  * Without --data the host looks for the game (plat_find_data in
  * platform/common.h).
@@ -46,6 +49,7 @@
 #ifndef __vita__
 #include "platform/common.h"
 #endif
+#include "settings.h"
 #include "startup.h"
 #include "vfs.h"
 #include "race/debug.h"
@@ -54,8 +58,11 @@
 #include "video.h"
 
 #ifdef __vita__
-/* The extracted disc; the .cue and .bin for the music sit next to it. */
+/* The game's files (the GOG or Steam release, copied as it is, with
+ * game.ins and MUSIC/ in it), or else an extracted disc in disc/ with its
+ * .cue and .bin beside it. */
 #define DEFAULT_DATA "ux0:data/ignition/disc"
+#define GAME_DATA "ux0:data/ignition"
 #else
 #define DEFAULT_DATA "data/Ignition/disc"
 #endif
@@ -137,6 +144,27 @@ int main(int argc, char **argv)
     const char *text_arg = NULL;
     int i;
 
+#ifdef __vita__
+    {
+        /* The Vita has no command line: ux0:data/ignition/shots.txt lists
+         * screenshots to take, a line "MS name.tga" each (MS from the start). */
+        FILE *fp = fopen(GAME_DATA "/shots.txt", "r");
+        char line[256];
+
+        while (fp != NULL && fgets(line, sizeof(line), fp) != NULL) {
+            unsigned ms;
+            char name[128], path[256];
+
+            if (sscanf(line, "%u %127s", &ms, name) == 2) {
+                snprintf(path, sizeof(path), GAME_DATA "/%s", name);
+                video_schedule_shot(ms, path);
+            }
+        }
+        if (fp != NULL) {
+            fclose(fp);
+        }
+    }
+#endif
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
             data = argv[++i];
@@ -158,6 +186,17 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--soft3d") == 0) {
             g_soft3d = 1;
             canvas_set_hardware(0);
+        } else if (strcmp(argv[i], "--effects") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+
+            if (strcmp(mode, "2d") == 0) {
+                g_effects_override = 0;
+            } else if (strcmp(mode, "3d") == 0) {
+                g_effects_override = 1;
+            } else {
+                fprintf(stderr, "--effects takes 2d or 3d\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--res") == 0 && i + 1 < argc) {
             canvas_force_resolution(atoi(argv[++i]));
         } else if (strcmp(argv[i], "--autopilot") == 0) {
@@ -197,7 +236,14 @@ int main(int argc, char **argv)
     }
     if (data == NULL) {
 #ifdef __vita__
-        data = DEFAULT_DATA;
+        FILE *probe = fopen(GAME_DATA "/BALTAZAR/DATA/MENU.COL", "rb");
+
+        if (probe != NULL) {
+            fclose(probe);
+            data = GAME_DATA;
+        } else {
+            data = DEFAULT_DATA;
+        }
 #else
         data = plat_find_data(DEFAULT_DATA);
 #endif

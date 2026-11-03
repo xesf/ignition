@@ -11,6 +11,7 @@
 #include "gfx.h"
 #include "platform/platform.h"
 #include "video.h"
+#include "prof.h"
 #include "lisa/sprite.h"
 #include "lisa/turned.h"
 #include "stubs.h"
@@ -22,6 +23,12 @@ float g_view_scale = 1.0f;
 
 static int s_gfx_ready;
 static const u8 *s_present;     /* a canvas surface to show, or NULL */
+static const u8 *s_blit_src;    /* the last whole screen video_blit was given, or NULL */
+static const u8 *screen_pixels(void)
+{
+    return s_blit_src != NULL ? s_blit_src : g_video_screen;
+}
+
 static unsigned s_layer;
 static const u8 *s_layer_snapshot;
 static int s_screen_w, s_screen_h;
@@ -89,6 +96,7 @@ int video_set_mode(void)
     }
     free(g_video_screen);
     g_video_screen = screen;
+    s_blit_src = NULL;
     s_screen_w = g_video_mode.width;
     s_screen_h = g_video_mode.height;
     return 1;
@@ -119,6 +127,14 @@ int video_blit(const u8 *src, int pitch, int x, int y, int w, int h, int dx, int
     if (dx < 0 || dy < 0 || dx + w > s_screen_w || dy + h > s_screen_h) {
         return 0;
     }
+    /* A whole screen: shown from where it is, without a copy (it stays
+     * as it is until the next frame draws), as g_video_screen. */
+    if (x == 0 && y == 0 && dx == 0 && dy == 0 && w == s_screen_w && h == s_screen_h
+        && pitch == w) {
+        s_blit_src = src;
+        return 1;
+    }
+    s_blit_src = NULL;
     for (row = 0; row < h; row++) {
         memcpy(g_video_screen + (dy + row) * s_screen_w + dx,
                src + (y + row) * pitch + x, (size_t)w);
@@ -138,6 +154,7 @@ int video_clear(void)
     if (g_video_screen == NULL) {
         return 0;
     }
+    s_blit_src = NULL;
     memset(g_video_screen, 0, (size_t)s_screen_w * (size_t)s_screen_h);
     return 1;
 }
@@ -212,7 +229,7 @@ static void write_drawable_shot(int w, int h)
             row[3 * x] = row[3 * x + 2];
             row[3 * x + 2] = t;
         }
-        fwrite(row, 3, (size_t)w, fp);
+        fwrite(row, 1, (size_t)w * 3, fp);
     }
     fclose(fp);
     free(rgb);
@@ -237,13 +254,20 @@ static void write_shot(void)
     fwrite(header, 1, sizeof(header), fp);
     for (y = 0; y < s_screen_h; y++) {
         for (x = 0; x < s_screen_w; x++) {
-            const u8 *c = &g_video_palette[3 * g_video_screen[y * s_screen_w + x]];
+            const u8 *c = &g_video_palette[3 * screen_pixels()[y * s_screen_w + x]];
             u8 bgr[3] = { c[2], c[1], c[0] };
 
             fwrite(bgr, 1, 3, fp);
         }
     }
     fclose(fp);
+}
+
+static int s_shot_requested;
+
+void video_request_shot(void)
+{
+    s_shot_requested = 1;
 }
 
 void video_present(void)
@@ -253,19 +277,37 @@ void video_present(void)
     if (!s_gfx_ready || g_video_screen == NULL) {
         return;
     }
+    if (s_shot_requested && s_shot_path[0] == '\0') {
+        static int number;
+
+        s_shot_requested = 0;
+#ifdef __vita__
+        snprintf(s_shot_path, sizeof(s_shot_path), "ux0:data/ignition/shot%02d.tga", number++);
+#else
+        snprintf(s_shot_path, sizeof(s_shot_path), "shot%02d.tga", number++);
+#endif
+        s_shot_ms = 0;
+    }
+    prof_begin(PROF_P_GFX);
+    prof_begin(PROF_G_SYNC);
     canvas_sync_drawable();
     plat_drawable_size(&w, &h);
+    prof_end(PROF_G_SYNC);
+    prof_begin(PROF_G_BEGIN);
     gfx_begin_frame(w, h);
+    prof_end(PROF_G_BEGIN);
+    prof_begin(PROF_G_LAYERS);
     if (s_present != NULL) {
         gfx_draw_index_texture(canvas_texture(s_present), g_video_palette,
                                canvas_aspect(s_present, video_aspect()));
     } else if (s_layer != 0) {
-        gfx_draw_layers(s_layer, g_video_screen, s_layer_snapshot, s_screen_w, s_screen_h,
+        gfx_draw_layers(s_layer, screen_pixels(), s_layer_snapshot, s_screen_w, s_screen_h,
                         s_screen_w, g_video_palette, video_aspect());
     } else {
-        gfx_draw_screen(g_video_screen, s_screen_w, s_screen_h, s_screen_w,
+        gfx_draw_screen(screen_pixels(), s_screen_w, s_screen_h, s_screen_w,
                         g_video_palette, video_aspect());
     }
+    prof_end(PROF_G_LAYERS);
     if (s_shot_path[0] != '\0' && plat_time_ms() >= s_shot_ms) {
         if (s_layer != 0 || s_present != NULL) {
             write_drawable_shot(w, h);
@@ -279,11 +321,18 @@ void video_present(void)
             s_shot_next++;
         }
     }
+    prof_end(PROF_P_GFX);
     plat_present();
+}
+
+void video_set_overlay(unsigned overlay)
+{
+    gfx_set_overlay(overlay);
 }
 
 void video_set_layer(unsigned layer, const u8 *snapshot)
 {
+    gfx_set_overlay(0);
     s_layer = layer;
     s_layer_snapshot = snapshot;
 }

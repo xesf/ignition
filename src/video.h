@@ -69,6 +69,11 @@ float video_aspect(void);
 /* Shows `layer` (gl3d_view_texture) under the screen; where the screen
  * equals `snapshot` the layer shows through. 0 for none. */
 void video_set_layer(unsigned layer, const u8 *snapshot);
+/* An RGBA layer (premultiplied) shown over the 3D layer, under the
+ * screen's changes; 0 for none. video_set_layer clears it. */
+void video_set_overlay(unsigned overlay);
+/* A screenshot of the next frame, to shotNN.tga (the Vita's L and R). */
+void video_request_shot(void);
 void video_drawable_size(int *w, int *h);
 
 #endif /* IGN_VIDEO_H */

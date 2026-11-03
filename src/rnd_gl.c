@@ -369,6 +369,37 @@ static const char *s_dyn_fs =
     "    o_index = vec2(c / 255.0, 1.0);\n"
     "}\n";
 
+/* PARTICLE: as DYN, but the colour index goes through a row of the
+ * 256 x 1 RGBA table (premultiplied, alpha 1 - k) instead of a copy of
+ * the pixel under it. */
+static const char *s_particle_fs =
+    "#version 150\n"
+    "uniform sampler2DArray u_pages;\n"
+    "uniform sampler2D u_table;\n"
+    "in vec2 v_uv;\n"
+    "flat in vec3 v_info;\n"
+    "out vec4 o_color;\n"
+    "void main() {\n"
+    "    float c = v_info.z > 2.5 ? floor(v_uv.x) : v_info.y;\n"
+    "    if (v_info.z < 1.5) {\n"
+    "        c = texture(u_pages, vec3(v_uv, v_info.x)).r * 255.0;\n"
+    "        if (v_info.z > 0.5 && c < 0.5) {\n"
+    "            discard;\n"
+    "        }\n"
+    "    }\n"
+    "    o_color = texelFetch(u_table, ivec2(int(c + 0.5), 0), 0);\n"
+    "}\n";
+
+/* LAYER: an RGBA layer over the screen. */
+static const char *s_layer_fs =
+    "#version 150\n"
+    "uniform sampler2D u_layer;\n"
+    "in vec2 v_uv;\n"
+    "out vec4 o_color;\n"
+    "void main() {\n"
+    "    o_color = texture(u_layer, v_uv);\n"
+    "}\n";
+
 /* RASTER: pixels in, the index out. Modes: 0 the texel, 1 the colour,
  * 2 the texel and 3 the colour through the table with the pixel under
  * them. Vertices go half a pixel left and up, as the original fills a
@@ -427,6 +458,8 @@ static const struct {
       "o_index", 6 },
     { { 2, 2, 3, 0 }, { "a_pos", "a_uv", "a_info" }, { "u_pages", "u_table", "u_dst" },
       "o_index", 0 },
+    { { 4, 2, 3, 0 }, { "a_pos", "a_uv", "a_info" }, { "u_pages", "u_table" }, "o_color", 0 },
+    { { 0 }, { NULL }, { "u_layer" }, "o_color", 0 },
 };
 
 static const char *s_uniform_names[RND_UNIFORMS] = {
@@ -590,6 +623,7 @@ int rnd_init(void)
         { s_canvas_vs, s_canvas_fs }, { s_present_vs, s_present_fs },
         { s_present_vs, s_over_fs }, { s_mesh_vs, s_mesh_fs },
         { s_dyn_vs, s_dyn_fs }, { s_raster_vs, s_raster_fs },
+        { s_dyn_vs, s_particle_fs }, { s_present_vs, s_layer_fs },
     };
     int p;
 
@@ -620,12 +654,12 @@ void rnd_shutdown(void)
 
 static GLenum gl_internal(int format)
 {
-    return format == RND_RG8 ? GL_RG8 : format == RND_RGB8 ? GL_RGB8 : GL_R8;
+    return format == RND_RG8 ? GL_RG8 : format == RND_RGB8 ? GL_RGB8 : format == RND_RGBA8 ? GL_RGBA8 : GL_R8;
 }
 
 static GLenum gl_format(int format)
 {
-    return format == RND_RG8 ? GL_RG : format == RND_RGB8 ? GL_RGB : GL_RED;
+    return format == RND_RG8 ? GL_RG : format == RND_RGB8 ? GL_RGB : format == RND_RGBA8 ? GL_RGBA : GL_RED;
 }
 
 unsigned rnd_texture(int format, int w, int h, const void *pixels, int pitch)
@@ -736,6 +770,33 @@ unsigned rnd_target(unsigned color, int depth)
     }
     glBindFramebuffer(GL_FRAMEBUFFER, FB(s_bound));
     return f;
+}
+
+unsigned rnd_target_shared(unsigned color, unsigned other)
+{
+    GLuint f;
+    struct fb *r;
+    GLuint depth = fb_rec(other)->depth;
+
+    glGenFramebuffers(1, &f);
+    glBindFramebuffer(GL_FRAMEBUFFER, f);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+    r = fb_rec(f);
+    r->color = color;
+    r->depth = 0;           /* not owned */
+    glBindFramebuffer(GL_FRAMEBUFFER, FB(s_bound));
+    return f;
+}
+
+void rnd_blend(int mode)
+{
+    if (mode == RND_BLEND_OFF) {
+        glDisable(GL_BLEND);
+    } else {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    }
 }
 
 void rnd_target_free(unsigned target)
@@ -964,5 +1025,13 @@ void rnd_present(void)
 /* A copy is cheap: each face copies what it covers. */
 int rnd_batch_copies(void)
 {
-    return 0;
+    /* IGN_BATCH=1 draws as the Vita does, in layers, to try it here. */
+    static int batch = -1;
+
+    if (batch < 0) {
+        const char *e = getenv("IGN_BATCH");
+
+        batch = e != NULL && e[0] == '1';
+    }
+    return batch;
 }

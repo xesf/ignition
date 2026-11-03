@@ -33,6 +33,8 @@ void gfx_draw_screen(const u8 *pixels, int w, int h, int pitch,
 /* Draws `layer`, a texture of colour indices (rnd.h) (row 0 at the top),
  * over the whole drawable, then the surface over it as gfx_draw_screen
  * places it, but only its pixels that differ from `snapshot`. */
+/* An RGBA layer gfx_draw_layers puts over the 3D; 0 for none. */
+void gfx_set_overlay(unsigned overlay);
 void gfx_draw_layers(unsigned layer, const u8 *pixels, const u8 *snapshot, int w, int h,
                      int pitch, const u8 *palette, float aspect);
 

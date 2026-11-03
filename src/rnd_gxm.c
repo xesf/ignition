@@ -51,6 +51,7 @@
 #include <string.h>
 
 #include "rnd.h"
+#include "prof.h"
 
 #define SHADER_DIR "ux0:data/ignition/shaders"
 
@@ -211,6 +212,31 @@ static const char s_dyn_f[] =
     "    return float4((c + 0.25) / 255.0, 1.0, 0.0, 1.0);\n"
     "}\n";
 
+/* PARTICLE: as DYN, but the colour index is a row of u_table (256 x 1
+ * RGBA, premultiplied; fx_blend.h), blended by the fragment program. */
+static const char s_particle_f[] =
+    PAGES_TEXEL
+    "float4 main(float2 v_uv : TEXCOORD0, float3 v_info : TEXCOORD1, float4 frag : WPOS,\n"
+    "            uniform sampler2D u_pages, uniform float3 u_grid, uniform sampler2D u_table,\n"
+    "            uniform float4 u_clip) : COLOR {\n"
+    CLIP_TEST
+    "    float c = v_info.z > 2.5 ? floor(v_uv.x) : floor(v_info.y + 0.5);\n"
+    "    if (v_info.z < 1.5) {\n"
+    "        float2 t = min(floor(frac(v_uv) * 256.0), 255.0);\n"
+    "        c = pages_texel(u_pages, u_grid, floor(v_info.x + 0.5), t);\n"
+    "        if (v_info.z > 0.5 && c < 0.5) {\n"
+    "            discard;\n"
+    "        }\n"
+    "    }\n"
+    "    return tex2D(u_table, float2((c + 0.5) / 256.0, 0.5));\n"
+    "}\n";
+
+/* LAYER: an RGBA layer, blended over the screen. */
+static const char s_layer_f[] =
+    "float4 main(float2 v_uv : TEXCOORD0, uniform sampler2D u_layer) : COLOR {\n"
+    "    return tex2D(u_layer, v_uv);\n"
+    "}\n";
+
 static const char s_raster_v[] =
     "void main(float2 a_pos, float2 a_uv, float3 a_info, uniform float2 u_size,\n"
     "          uniform float2 u_off, float2 out v_uv : TEXCOORD0,\n"
@@ -302,6 +328,9 @@ static const struct {
       { "u_pages", "u_table", "u_dst" } },
     { "raster", s_raster_v, s_raster_f, { { "a_pos", 2 }, { "a_uv", 2 }, { "a_info", 3 } }, 8,
       { "u_pages", "u_table", "u_dst" } },
+    { "particle", s_dyn_v, s_particle_f, { { "a_pos", 4 }, { "a_uv", 2 }, { "a_info", 3 } }, 9,
+      { "u_pages", "u_table" } },
+    { "layer", s_present_v, s_layer_f, { { "a_corner", 2 } }, 2, { "u_layer" } },
     { "clear", s_clear_v, s_clear_f, { { "a_pos", 2 } }, 2, { NULL } },
     { "copy", s_copy_v, s_copy_f, { { "a_pos", 2 }, { "a_uv", 2 } }, 4, { "u_src" } },
 };
@@ -493,6 +522,7 @@ struct texture {
      * flight and a cached copy of each, and gets only its changed rows
      * (rnd_texture_set). */
     u8 *ring[FRAMES], *shadow[FRAMES];
+    u8 *rowzero[FRAMES];        /* 1: the ring's row was all zero when last filled */
     int ring_w, ring_h, in_ring;
     unsigned set_frame;
 };
@@ -504,6 +534,7 @@ struct target {
     void *depth_data;
     int depth_w, depth_h;
     int depth_fresh;            /* cleared: the next scene does not load it */
+    unsigned depth_of;          /* draws with this target's depth buffer (rnd_target_shared) */
     SceGxmColorSurface surface;
     SceGxmDepthStencilSurface ds;
 };
@@ -698,6 +729,7 @@ static struct {
     int frames, scenes, finishes, uploads, reads, copies, draws;
     SceUInt64 since, begin_us, wait_us, queue_us, draw_us, fill_us, mesh_us, stream_us;
     u32 mesh_bytes, stream_bytes, fill_bytes;
+    u32 ring_fills, rows_total, rows_skipped, rows_copied, ring_w, ring_h;
 } s_stats;
 
 /* Microseconds spent in a call that may block on the GPU. */
@@ -734,6 +766,13 @@ static void stats_frame(void)
                s_stats.mesh_bytes / 1024.0 / n, s_stats.stream_us / 1000.0 / n,
                s_stats.stream_bytes / 1024.0 / n, s_stats.fill_bytes / 1024.0 / n,
                s_end_us / 1000.0 / n);
+        if (s_stats.ring_fills > 0) {
+            printf("gxm: a 2D picture of %ux%u: %.1f a frame, rows %.0f, empty and skipped %.0f, "
+                   "copied %.0f\n", s_stats.ring_w, s_stats.ring_h,
+                   (double)s_stats.ring_fills / n, (double)s_stats.rows_total / s_stats.ring_fills,
+                   (double)s_stats.rows_skipped / s_stats.ring_fills,
+                   (double)s_stats.rows_copied / s_stats.ring_fills);
+        }
         s_end_us = 0;
         memset(&s_stats, 0, sizeof(s_stats));
         s_stats.since = now;
@@ -756,6 +795,8 @@ static void set_viewport(int w, int h, int flip)
 }
 
 /* Begins a scene on target t (0 the screen). */
+static int bytes_per_texel(int format);
+
 static int begin_scene(unsigned t)
 {
     s_stats.scenes++;
@@ -790,10 +831,11 @@ static int begin_scene(unsigned t)
     }
     sceGxmColorSurfaceInit(&g->surface,
                            c->format == RND_RG8 ? SCE_GXM_COLOR_FORMAT_U8U8_GR
-                                                : SCE_GXM_COLOR_FORMAT_U8_R,
+                           : c->format == RND_RGBA8 ? SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR
+                                                    : SCE_GXM_COLOR_FORMAT_U8_R,
                            SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
                            SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, (u32)c->w, (u32)c->h,
-                           c->stride / (c->format == RND_RG8 ? 2 : 1), c->data);
+                           c->stride / (u32)bytes_per_texel(c->format), c->data);
     if (g->depth) {
         if (g->depth_data == NULL || c->w > g->depth_w || c->h > g->depth_h) {
             int aw, ah;
@@ -810,6 +852,14 @@ static int begin_scene(unsigned t)
                                                   : SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
         g->depth_fresh = 0;
         ds = &g->ds;
+    } else if (g->depth_of != 0 && tgt_get(g->depth_of) != NULL
+               && tgt_get(g->depth_of)->depth_data != NULL) {
+        struct target *o = tgt_get(g->depth_of);
+
+        sceGxmDepthStencilSurfaceSetForceLoadMode(&o->ds, o->depth_fresh
+                                                  ? SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED
+                                                  : SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
+        ds = &o->ds;
     } else {
         if (c->w > s_scratch_w || c->h > s_scratch_h) {
             int aw, ah;
@@ -910,22 +960,32 @@ void rnd_present(void)
     if (s_ctx == NULL) {
         return;
     }
+    prof_begin(PROF_P_SCENE);
     if (!scene_on(0)) {
         return;
     }
+    prof_end(PROF_P_SCENE);
     n.address = &s_notes[s_slot];
     n.value = ++s_serial;
     s_fence[s_slot] = s_serial;
+    prof_begin(PROF_P_END);
     sceGxmEndScene(s_ctx, NULL, &n);
+    prof_end(PROF_P_END);
     s_in_scene = 0;
+    prof_begin(PROF_P_PAD);
     sceGxmPadHeartbeat(&s_display_surface[s_back], s_display_sync[s_back]);
+    prof_end(PROF_P_PAD);
     d.address = s_display[s_back];
+    prof_begin(PROF_P_QUEUE);
     TIMED(queue_us, sceGxmDisplayQueueAddEntry(s_display_sync[s_front], s_display_sync[s_back], &d));
+    prof_end(PROF_P_QUEUE);
     s_front = s_back;
     s_back = (s_back + 1) % DISPLAY_BUFFERS;
     s_slot = (s_slot + 1) % FRAMES;
     s_frame_no++;
+    prof_begin(PROF_P_SLOT);
     slot_begin(s_slot);
+    prof_end(PROF_P_SLOT);
     stats_frame();
 }
 
@@ -1097,6 +1157,7 @@ static int make_program(int p)
 {
     SceGxmVertexAttribute attrs[3];
     SceGxmVertexStream stream;
+    const SceGxmBlendInfo *blend;
     unsigned n = 0, off = 0;
     int i;
 
@@ -1121,13 +1182,23 @@ static int make_program(int p)
         }
         off += (unsigned)s_def[p].attrs[i].floats;
     }
+    {
+        /* PARTICLE and LAYER blend, premultiplied: src + (1 - src.a) dst. */
+        static const SceGxmBlendInfo premul = {
+            SCE_GXM_COLOR_MASK_ALL, SCE_GXM_BLEND_FUNC_ADD, SCE_GXM_BLEND_FUNC_ADD,
+            SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            SCE_GXM_BLEND_FACTOR_ONE, SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+        };
+
+        blend = p == RND_PARTICLE || p == RND_LAYER ? &premul : NULL;
+    }
     stream.stride = (u16)(s_def[p].stride * sizeof(float));
     stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
     if (sceGxmShaderPatcherCreateVertexProgram(s_patcher, s_prog[p].vid, attrs, n, &stream, 1,
                                                &s_prog[p].vp) < 0
         || sceGxmShaderPatcherCreateFragmentProgram(s_patcher, s_prog[p].fid,
                                                     SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
-                                                    SCE_GXM_MULTISAMPLE_NONE, NULL,
+                                                    SCE_GXM_MULTISAMPLE_NONE, blend,
                                                     s_prog[p].vgxp, &s_prog[p].fp) < 0) {
         printf("gxm: %s: patching failed\n", s_def[p].name);
         return 0;
@@ -1364,20 +1435,20 @@ void rnd_shutdown(void)
 
 static int bytes_per_texel(int format)
 {
-    return format == RND_RG8 ? 2 : format == RND_RGB8 ? 4 : 1;
+    return format == RND_RG8 ? 2 : format == RND_RGB8 || format == RND_RGBA8 ? 4 : 1;
 }
 
 static SceGxmTextureFormat gxm_format(int format)
 {
     return format == RND_RG8 ? SCE_GXM_TEXTURE_FORMAT_U8U8_GR
-           : format == RND_RGB8 ? SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR
+           : format == RND_RGB8 || format == RND_RGBA8 ? SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR
            : SCE_GXM_TEXTURE_FORMAT_U8_R;
 }
 
 /* Rows of `pixels` into texture memory; RGB8 gains an alpha. */
 static void fill(u8 *dst, u32 stride, int format, int w, int h, const u8 *pixels, int pitch)
 {
-    int y, x, bpp = format == RND_RG8 ? 2 : format == RND_RGB8 ? 3 : 1;
+    int y, x, bpp = format == RND_RG8 ? 2 : format == RND_RGB8 ? 3 : format == RND_RGBA8 ? 4 : 1;
 
     if (pixels == NULL) {
         memset(dst, 0, (size_t)stride * h);
@@ -1434,8 +1505,10 @@ static void ring_free(struct texture *r)
     for (k = 0; k < FRAMES; k++) {
         gpu_free(r->ring[k]);
         free(r->shadow[k]);
+        free(r->rowzero[k]);
         r->ring[k] = NULL;
         r->shadow[k] = NULL;
+        r->rowzero[k] = NULL;
     }
     r->ring_w = r->ring_h = 0;
     if (r->in_ring) {
@@ -1448,10 +1521,50 @@ static void ring_free(struct texture *r)
  * differ from what it holds. The buffer was last read by the frame
  * FRAMES ago, which slot_begin waited for. 0 when the ring cannot be
  * had. */
+/* Whether n bytes are equal, a word at a time (the C library's memcmp
+ * goes a byte at a time here, and a 2D screen has half a megabyte to
+ * compare each frame). */
+static int same_bytes(const u8 *a, const u8 *b, size_t n)
+{
+    size_t i = 0;
+
+    for (; i + 16 <= n; i += 16) {
+        u32 x[4], y[4];
+
+        memcpy(x, a + i, 16);
+        memcpy(y, b + i, 16);
+        if (((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3])) != 0) {
+            return 0;
+        }
+    }
+    return memcmp(a + i, b + i, n - i) == 0;
+}
+
+/* Whether n bytes are all zero. */
+static int is_zero(const u8 *a, size_t n)
+{
+    size_t i = 0;
+
+    for (; i + 16 <= n; i += 16) {
+        u32 x[4];
+
+        memcpy(x, a + i, 16);
+        if ((x[0] | x[1] | x[2] | x[3]) != 0) {
+            return 0;
+        }
+    }
+    for (; i < n; i++) {
+        if (a[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int ring_fill(struct texture *r, int w, int h, const u8 *pixels, int pitch)
 {
     u32 stride = stride_of(r->format, w);
-    int bpp = r->format == RND_RG8 ? 2 : 1, k, y;
+    int bpp = r->format == RND_RG8 ? 2 : r->format == RND_RGBA8 ? 4 : 1, k, y;
     u8 *mem, *shadow;
 
     if (r->ring_w != w || r->ring_h != h) {
@@ -1459,7 +1572,8 @@ static int ring_fill(struct texture *r, int w, int h, const u8 *pixels, int pitc
         for (k = 0; k < FRAMES; k++) {
             r->ring[k] = gpu_alloc(stride * (u32)h, 256, 0);
             r->shadow[k] = malloc((size_t)w * bpp * h);
-            if (r->ring[k] == NULL || r->shadow[k] == NULL) {
+            r->rowzero[k] = calloc((size_t)h, 1);
+            if (r->ring[k] == NULL || r->shadow[k] == NULL || r->rowzero[k] == NULL) {
                 ring_free(r);
                 return 0;
             }
@@ -1472,15 +1586,33 @@ static int ring_fill(struct texture *r, int w, int h, const u8 *pixels, int pitc
     if (pitch == 0) {
         pitch = w;
     }
+    s_stats.ring_fills++;
+    s_stats.ring_w = (u32)w;
+    s_stats.ring_h = (u32)h;
     mem = r->ring[s_slot];
     shadow = r->shadow[s_slot];
     for (y = 0; y < h; y++) {
         const u8 *src = pixels + (size_t)y * pitch * bpp;
         u8 *was = shadow + (size_t)y * w * bpp;
+        u8 *zero = &r->rowzero[s_slot][y];
 
-        if (memcmp(was, src, (size_t)w * bpp) != 0) {
+        /* A 2D screen is mostly empty rows: one that is empty now and was
+         * when this buffer was last filled needs no comparing against the
+         * copy, which is a second pass over memory. */
+        s_stats.rows_total++;
+        if (is_zero(src, (size_t)w * bpp)) {
+            if (*zero) {
+                s_stats.rows_skipped++;
+                continue;
+            }
+            *zero = 1;
+        } else {
+            *zero = 0;
+        }
+        if (!same_bytes(was, src, (size_t)w * bpp)) {
             memcpy(was, src, (size_t)w * bpp);
             s_stats.fill_bytes += (u32)(w * bpp);
+            s_stats.rows_copied++;
             TIMED(fill_us, memcpy(mem + (size_t)y * stride, src, (size_t)w * bpp));
         }
     }
@@ -1542,7 +1674,9 @@ void rnd_texture_set(unsigned tex, int w, int h, const void *pixels, int pitch)
     r->alias = 0;
     if (r->drawn && w == r->w && h == r->h) {
         /* The GPU draws into it: fill it in place once it is done. */
+        prof_begin(PROF_T_FIN);
         finish();
+        prof_end(PROF_T_FIN);
         TIMED(fill_us, fill(r->data, r->stride, r->format, w, h, pixels, pitch));
         return;
     }
@@ -1550,13 +1684,17 @@ void rnd_texture_set(unsigned tex, int w, int h, const void *pixels, int pitch)
     if (!r->drawn && pixels != NULL && r->format != RND_RGB8 && w * h >= 0x10000
         && r->set_frame != s_frame_no + 1) {
         r->set_frame = s_frame_no + 1;
+        prof_begin(PROF_T_RING);
         if (ring_fill(r, w, h, pixels, pitch)) {
+            prof_end(PROF_T_RING);
             tex_init(r);
             return;
         }
+        prof_end(PROF_T_RING);
     }
     r->set_frame = s_frame_no + 1;
     /* New memory, as draws still to run may read the old. */
+    prof_begin(PROF_T_ALLOC);
     data = gpu_alloc(stride_of(r->format, w) * (u32)h, 256, r->drawn);
     if (data == NULL) {
         return;
@@ -1564,12 +1702,15 @@ void rnd_texture_set(unsigned tex, int w, int h, const void *pixels, int pitch)
     if (!r->in_ring) {
         gpu_free(r->data);
     }
+    prof_end(PROF_T_ALLOC);
     r->in_ring = 0;
     r->data = data;
     r->w = w;
     r->h = h;
     r->stride = stride_of(r->format, w);
+    prof_begin(PROF_T_FILL);
     TIMED(fill_us, fill(r->data, r->stride, r->format, w, h, pixels, pitch));
+    prof_end(PROF_T_FILL);
     tex_init(r);
 }
 
@@ -1664,6 +1805,22 @@ unsigned rnd_target(unsigned color, int depth)
     s_tgt[i].depth_fresh = 1;
     c->drawn = 1;
     return i;
+}
+
+unsigned rnd_target_shared(unsigned color, unsigned other)
+{
+    unsigned t = rnd_target(color, 0);
+
+    if (t != 0) {
+        s_tgt[t].depth_of = other;
+    }
+    return t;
+}
+
+/* PARTICLE and LAYER are patched with the blend: always on for them. */
+void rnd_blend(int mode)
+{
+    (void)mode;
 }
 
 void rnd_target_free(unsigned target)
@@ -2065,7 +2222,7 @@ void rnd_draw(int prim, int first, int count)
 {
     const u8 *v;
 
-    if (s_use == RND_PRESENT || s_use == RND_OVER) {
+    if (s_use == RND_PRESENT || s_use == RND_OVER || s_use == RND_LAYER) {
         v = (const u8 *)s_corners;
     } else if (s_stream == NULL) {
         return;

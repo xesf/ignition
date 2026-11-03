@@ -25,6 +25,10 @@
 #include "cdimage.h"
 #include "compat.h"
 
+#define STB_VORBIS_HEADER_ONLY
+#define STB_VORBIS_NO_PUSHDATA_API
+#include "third_party/stb_vorbis.c"
+
 enum {
     MAX_FILES = 99,
     MAX_TRACKS = 99,
@@ -36,6 +40,7 @@ enum {
 struct cue_file {
     char path[1024];
     int wave;               /* WAVE: samples after the RIFF header */
+    int ogg;                /* Ogg Vorbis: size is the decoded 16 bit stereo's */
     int big_endian;         /* MOTOROLA */
     long data_start;        /* where the sectors start */
     long size;
@@ -124,12 +129,50 @@ static int add_file(const char *cue_dir, const char *name, const char *type)
     f = &s_files[s_file_count];
     memset(f, 0, sizeof(*f));
     snprintf(f->path, sizeof(f->path), "%s/%s", cue_dir, name);
+    /* Sheets from Windows name files with backslashes. */
+    {
+        char *c;
+
+        for (c = f->path; *c != '\0'; c++) {
+            if (*c == '\\') {
+                *c = '/';
+            }
+        }
+    }
     f->wave = strcasecmp(type, "WAVE") == 0;
     f->big_endian = strcasecmp(type, "MOTOROLA") == 0;
+    {
+        size_t n = strlen(f->path);
+
+        f->ogg = n > 4 && strcasecmp(f->path + n - 4, ".ogg") == 0;
+    }
     fp = fopen(f->path, "rb");
+    if (fp == NULL && strcasecmp(type, "BINARY") == 0) {
+        /* The data track's image (the GOG release's game.gog, 400 MB) is
+         * not needed when the game's files are there as they are. */
+        fprintf(stderr, "cdimage: %s is missing: only its audio tracks\n", f->path);
+        s_file_count++;
+        return 1;
+    }
     if (fp == NULL) {
         fprintf(stderr, "cdimage: %s is missing\n", f->path);
         return 0;
+    }
+    if (f->ogg) {
+        int err = 0;
+        stb_vorbis *v;
+
+        fclose(fp);
+        v = stb_vorbis_open_filename(f->path, &err, NULL);
+        if (v == NULL) {
+            fprintf(stderr, "cdimage: %s does not decode (%d)\n", f->path, err);
+            return 0;
+        }
+        /* As 16 bit stereo, the sectors the track would take on a disc. */
+        f->size = (long)stb_vorbis_stream_length_in_samples(v) * 4;
+        stb_vorbis_close(v);
+        s_file_count++;
+        return 1;
     }
     if (f->wave) {
         f->data_start = wave_data_start(fp);
@@ -354,17 +397,19 @@ int cdimage_open(const char *cue_path, const char *cache_dir)
         return 0;
     }
     s_data = &s_tracks[i];
-    if (!read_sector(16, pvd) || pvd[0] != 1 || memcmp(pvd + 1, "CD001", 5) != 0) {
-        fprintf(stderr, "cdimage: %s has no ISO 9660 data track\n", cue_path);
-        return 0;
-    }
     s_entries = calloc(MAX_ENTRIES, sizeof(*s_entries));
     if (s_entries == NULL) {
         return 0;
     }
     s_entry_count = 0;
-    walk_dir(rd32(pvd + 156 + 2), rd32(pvd + 156 + 10), "", 0);
-    find_root();
+    if (!read_sector(16, pvd) || pvd[0] != 1 || memcmp(pvd + 1, "CD001", 5) != 0) {
+        /* No image of the data (the GOG release's is optional): the audio
+         * tracks still play, and the game's files are read as they are. */
+        fprintf(stderr, "cdimage: %s has no ISO 9660 data track\n", cue_path);
+    } else {
+        walk_dir(rd32(pvd + 156 + 2), rd32(pvd + 156 + 10), "", 0);
+        find_root();
+    }
     snprintf(s_cache, sizeof(s_cache), "%s", cache_dir);
     s_open = 1;
     fprintf(stderr, "cdimage: %s, %d tracks, %d files\n",

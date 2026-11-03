@@ -25,7 +25,7 @@
 #include "types.h"
 
 /* Texture formats. RGB8 is the palette's: 3 bytes a texel. */
-enum { RND_R8, RND_RG8, RND_RGB8 };
+enum { RND_R8, RND_RG8, RND_RGB8, RND_RGBA8 };
 
 /* The programs. Each has its vertex layout (floats a vertex) and its
  * textures by unit:
@@ -40,9 +40,12 @@ enum { RND_R8, RND_RG8, RND_RGB8 };
  *            colour, mode
  *   RASTER   x, y, u, v, page,        0 pages, 1 table, 2 copy
  *            colour, mode, -
+ *   PARTICLE as DYN                   0 pages, 1 rows (256 x 1 RGBA8)
+ *   LAYER    none (a quad)            0 an RGBA8 layer
  *
  * The shaders and what the uniforms mean are in the backends. */
-enum { RND_CANVAS, RND_PRESENT, RND_OVER, RND_MESH, RND_DYN, RND_RASTER, RND_PROGRAMS };
+enum { RND_CANVAS, RND_PRESENT, RND_OVER, RND_MESH, RND_DYN, RND_RASTER, RND_PARTICLE, RND_LAYER,
+       RND_PROGRAMS };
 
 /* Uniforms, by the program that has them: CANVAS LSIZE, OFF (vec2),
  * MODE (0 or 1); PRESENT and OVER RECT (vec4); MESH MATRIX (mat4,
@@ -74,6 +77,10 @@ unsigned rnd_pages(const u8 *pixels, int count);
  * `depth`. Freeing it leaves the texture. */
 unsigned rnd_target(unsigned color, int depth);
 void rnd_target_free(unsigned target);
+/* A target drawing into `color` (RGBA8) that uses the depth buffer of
+ * target `other`, which it does not own. Free it with rnd_target_free
+ * before `other`. */
+unsigned rnd_target_shared(unsigned color, unsigned other);
 /* Draws into `target` from now on, the viewport all of it. */
 void rnd_bind(unsigned target);
 /* Draws into the screen, `w` x `h` pixels. */
@@ -96,6 +103,10 @@ void rnd_blit(unsigned src, unsigned dst, int sw, int sh, int dw, int dh);
 void rnd_scissor(int on, int x, int y, int w, int h);
 void rnd_depth(int func, int write);
 void rnd_cull(int mode);
+/* Blending of what a draw writes into the target (RGBA8 targets):
+ * RND_BLEND_PREMUL is src + (1 - src.a) * dst. */
+enum { RND_BLEND_OFF, RND_BLEND_PREMUL };
+void rnd_blend(int mode);
 /* Pulls faces a little toward the eye (glPolygonOffset(-1, -4)). */
 void rnd_offset(int on);
 

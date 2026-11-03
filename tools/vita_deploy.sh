@@ -3,7 +3,8 @@
 #
 #   ux0:app/IGNT00001/           eboot.bin, sce_sys/, shaders/ (the package)
 #   ux0:data/ignition/ignition.vpk   the package, for VitaShell
-#   ux0:data/ignition/disc/      the extracted disc, if it is not there
+#   ux0:data/ignition/           the game's files (the GOG or Steam release),
+#                                or disc/ with an extracted disc, if not there
 #
 #   tools/vita_deploy.sh pull    shaders the Vita compiled ->
 #                                platforms/vita/shaders/
@@ -27,12 +28,9 @@ VPK=build-vita/ignition.vpk
 SHADERS=platforms/vita/shaders
 # The first image folder under data/ by name, as the game picks it.
 first_disc() {
-    ls data 2>/dev/null | LC_ALL=C sort | while IFS= read -r n; do
-        if [ -d "data/$n/disc" ]; then
-            echo "data/$n/disc"
-            break
-        fi
-    done
+    for d in data/*/disc data/*/*/disc; do
+        [ -d "$d" ] && echo "${#d} $d"
+    done | LC_ALL=C sort -n | head -n 1 | cut -d' ' -f2-
 }
 : "${DATA:=$(first_disc)}"
 : "${VITA_PORT:=1337}"
@@ -96,7 +94,7 @@ put() {
 # The first image folder (the data's own first) whose .cue has more than
 # one track.
 music_image() {
-    for d in "$(dirname "$DATA")" data/*; do
+    for d in "$(dirname "$DATA")" data/* data/*/*; do
         c=$(ls "$d"/*.cue 2>/dev/null | grep -v '/\._' | head -n 1)
         if [ -n "$c" ] && [ "$(grep -c TRACK "$c")" -gt 1 ]; then
             echo "$d"
@@ -126,7 +124,14 @@ push() {
         # The music is on the image's audio tracks: an image of the data
         # track alone has none, so take the first image that has some.
         img=$(music_image)
-        if [ -z "$img" ]; then
+        if [ -f data/game.ins ] && [ -d data/MUSIC ]; then
+            # The GOG and Steam releases: game.ins and Ogg Vorbis files.
+            put data/game.ins data/ignition/game.ins
+            for f in data/MUSIC/*.ogg; do
+                [ -f "$f" ] && put "$f" "data/ignition/MUSIC/$(basename "$f")"
+            done
+            echo "vita_deploy: music from data/MUSIC"
+        elif [ -z "$img" ]; then
             echo "vita_deploy: no disc image under data/ has audio tracks" >&2
         else
             for f in "$img"/*.cue "$img"/*.bin; do

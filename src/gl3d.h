@@ -28,6 +28,11 @@ void gl3d_set_tables(const u8 *shd, const u8 *fixed);
 /* Meshes from begin to end change each frame and are never cached;
  * up to eight such runs, each named by its begin. */
 void gl3d_set_dynamic(const s32 *begin, const s32 *end);
+/* Meshes from begin to end are effects, drawn by the particle pass
+ * when EFFECTS is 3D (fx3d.h); up to four runs. */
+void gl3d_set_particles(const s32 *begin, const s32 *end);
+/* The particle layer of the view (RGBA8, premultiplied), 0 if none. */
+unsigned gl3d_particle_texture(void);
 void gl3d_view_fill(double y0, double y1, int index);
 void gl3d_mesh_changed(const s32 *mesh);
 void gl3d_view_resume(void);

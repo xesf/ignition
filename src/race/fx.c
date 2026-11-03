@@ -1829,6 +1829,7 @@ void race_effects_tick(void)
     int i;
 
     gl3d_set_dynamic(&g_part_meshes[0][0], &g_part_meshes[FX_SLOTS - 1][200]);
+    gl3d_set_particles(&g_part_meshes[0][0], &g_part_meshes[FX_SLOTS - 1][200]);
     gl3d_set_tables(g_level_shd, g_level_pan);
     for (i = 0; i < FX_SLOTS; i++) {
         struct race_effect *e = &g_effects[i];
@@ -2032,6 +2033,8 @@ void race_weather(void)
     if (g_weather == 1 || g_weather == 2) {
         gl3d_set_dynamic(g_weather_meshes[0], g_weather_meshes[0] + WEATHER_MESH_DWORDS);
         gl3d_set_dynamic(g_weather_meshes[1], g_weather_meshes[1] + WEATHER_MESH_DWORDS);
+        gl3d_set_particles(g_weather_meshes[0], g_weather_meshes[0] + WEATHER_MESH_DWORDS);
+        gl3d_set_particles(g_weather_meshes[1], g_weather_meshes[1] + WEATHER_MESH_DWORDS);
     }
     if (g_cars[0].f528 == 1 && !(r_54f980 < 120.0)) {
         if ((g_weather == 1 || g_weather == 2)

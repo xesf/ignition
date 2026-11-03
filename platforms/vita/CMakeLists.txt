@@ -71,15 +71,20 @@ target_link_libraries(ignition
 
 # LiveArea art, by tools/vita_sce_sys.py: from the game's own pictures
 # when an extracted disc is found (IGN_DISC, default the first
-# data/*/disc), else drawn.
+# data/*/disc or data/*/*/disc), else drawn.
 if(NOT DEFINED IGN_DISC)
-    file(GLOB DISCS ${ROOT}/data/*/disc)
-    list(SORT DISCS)
-    list(LENGTH DISCS n)
+    # An extracted disc, under data/ or one folder down; the shortest
+    # name, as the game picks it (the plain image before its rereleases).
+    file(GLOB DISCS ${ROOT}/data/*/disc ${ROOT}/data/*/*/disc)
     set(IGN_DISC "")
-    if(n GREATER 0)
-        list(GET DISCS 0 IGN_DISC)
-    endif()
+    set(best 100000)
+    foreach(d ${DISCS})
+        string(LENGTH "${d}" len)
+        if(len LESS best)
+            set(best ${len})
+            set(IGN_DISC "${d}")
+        endif()
+    endforeach()
 endif()
 set(SYS ${CMAKE_CURRENT_BINARY_DIR}/sce_sys)
 add_custom_command(

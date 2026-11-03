@@ -32,8 +32,15 @@ enum {
     SET_RENDERER = 0x598,
     /* The music's volume, 0 to 10 (the CD's in the original is on or
      * off). */
-    SET_MUSIC_VOLUME = 0x59c
+    SET_MUSIC_VOLUME = 0x59c,
+    /* The effects' drawing, in ign_port.cfg: 0 2D (sprites on the 2D
+     * layers), 1 3D (sprites in the 3D scene). Read when a race starts. */
+    SET_EFFECTS = 0x5a0
 };
+
+/* --effects 2d|3d: 0 or 1 overrides the saved effects setting once the
+ * port's settings are loaded; -1 keeps it. Defined in frontend.c. */
+extern int g_effects_override;
 
 static inline s32 settings_get(int offset)
 {

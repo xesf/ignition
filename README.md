@@ -123,6 +123,7 @@ make vita-deploy   # copies it to a Vita
 | `--host` | NETWORK GAME hosts a game. |
 | `--connect HOST` | NETWORK GAME joins the game at `HOST` (a name or IP address, with `:PORT` or without). |
 | `--soft3d` | Draws the 2D and the 3D on the CPU, as the original does. |
+| `--effects 2d\|3d` | Draws the race's effects as the original's 2D faces (`2d`) or as a GPU-blended layer over the 3D (`3d`), whatever is saved. |
 | `--fps` | Shows the race's frame rate (Alt+F switches it, and a second Alt+F adds the original's other debug lines). |
 | `--view FILE.PIC` | Shows one of the game's pictures. |
 | `--text TEXT` | Shows `TEXT` in the game's menu font. |

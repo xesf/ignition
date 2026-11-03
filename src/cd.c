@@ -11,6 +11,7 @@
 
 #include <dirent.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <string.h>
 #include <strings.h>
 
@@ -19,6 +20,10 @@
 #include "cdimage.h"
 #include "stubs.h"
 #include "vfs.h"
+
+#define STB_VORBIS_HEADER_ONLY
+#define STB_VORBIS_NO_PUSHDATA_API
+#include "third_party/stb_vorbis.c"
 
 s32 g_cd_present;               /* 0x50ef4c */
 s32 g_cd_track_count;           /* 0x50f070 */
@@ -36,12 +41,17 @@ static int s_playing_track;
 
 /* The track being streamed: its file, read up to the mixer's ring. */
 static FILE *s_fp;
+static stb_vorbis *s_ogg;       /* or a decoder, for Ogg Vorbis (GOG, Steam) */
 static u32 s_left;              /* frames still to read */
 static int s_swap;              /* big endian samples */
 static struct cd_stream *s_stream;
 
 static void stream_close(void)
 {
+    if (s_ogg != NULL) {
+        stb_vorbis_close(s_ogg);
+        s_ogg = NULL;
+    }
     if (s_fp != NULL) {
         fclose(s_fp);
         s_fp = NULL;
@@ -64,7 +74,18 @@ void cd_pump(void)
         if (room < n) {
             return;
         }
-        got = fread(buf, 4, n, s_fp);
+        if (s_ogg != NULL) {
+            /* Decoded to 16 bit stereo; the track ends where it does. */
+            int frames = stb_vorbis_get_samples_short_interleaved(s_ogg, 2, buf, (int)n * 2);
+
+            got = frames > 0 ? (size_t)frames : 0;
+            if (got == 0) {
+                s_left = 0;
+                break;
+            }
+        } else {
+            got = fread(buf, 4, n, s_fp);
+        }
         if (s_swap) {
             u8 *b = (u8 *)buf;
             size_t k;
@@ -77,7 +98,7 @@ void cd_pump(void)
             }
         }
         audio_cd_write(s_stream, buf, (u32)got);
-        s_left = got < n ? 0 : s_left - n;
+        s_left = got < n && s_ogg == NULL ? 0 : s_left - (u32)got;
     }
     if (s_stream != NULL) {
         audio_cd_end(s_stream);
@@ -97,6 +118,13 @@ static void find_cue(void)
     if (s_cue[0] != '\0') {
         return;
     }
+    /* The GOG and Steam releases keep the sheet (game.ins) in the game's
+     * own folder, with its music beside it. */
+    snprintf(dir, sizeof(dir), "%s/game.ins", vfs_root());
+    if (access(dir, R_OK) == 0) {
+        snprintf(s_cue, sizeof(s_cue), "%s", dir);
+        return;
+    }
     snprintf(dir, sizeof(dir), "%s", vfs_root());
     slash = strrchr(dir, '/');
     if (slash == NULL) {
@@ -112,7 +140,8 @@ static void find_cue(void)
 
         /* "._" files are macOS's notes on a copied file, not sheets. */
         if (n > 4 && strncmp(e->d_name, "._", 2) != 0
-            && strcasecmp(e->d_name + n - 4, ".cue") == 0) {
+            && (strcasecmp(e->d_name + n - 4, ".cue") == 0
+                || strcasecmp(e->d_name + n - 4, ".ins") == 0)) {
             snprintf(s_cue, sizeof(s_cue), "%s/%s", dir, e->d_name);
             break;
         }
@@ -226,8 +255,30 @@ int cd_play_track(int track)
         return 0;
     }
     stream_close();
-    s_fp = fopen(path, "rb");
-    if (s_fp == NULL || fseek(s_fp, offset, SEEK_SET) != 0) {
+    {
+        size_t len = strlen(path);
+
+        if (len > 4 && strcasecmp(path + len - 4, ".ogg") == 0) {
+            int err = 0;
+            stb_vorbis_info info;
+
+            s_ogg = stb_vorbis_open_filename(path, &err, NULL);
+            if (s_ogg == NULL) {
+                fprintf(stderr, "cd: track %d: cannot decode %s (%d)\n", track, path, err);
+                return 0;
+            }
+            info = stb_vorbis_get_info(s_ogg);
+            if ((int)info.sample_rate != AUDIO_RATE) {
+                fprintf(stderr, "cd: track %d: %u Hz, not %d\n", track, info.sample_rate,
+                        AUDIO_RATE);
+            }
+            offset = 0;
+        }
+    }
+    if (s_ogg == NULL) {
+        s_fp = fopen(path, "rb");
+    }
+    if ((s_ogg == NULL && (s_fp == NULL || fseek(s_fp, offset, SEEK_SET) != 0))) {
         fprintf(stderr, "cd: track %d: cannot read %s\n", track, path);
         stream_close();
         return 0;
