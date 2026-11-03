@@ -12,7 +12,10 @@ missing, a road running to the horizon on a dusk sky is drawn instead, so
 no art from the game is kept in the repository. The PNGs are 8 bit
 paletted, as the LiveArea needs.
 
-    tools/vita_sce_sys.py OUT [DISC]
+    tools/vita_sce_sys.py OUT [DISC [ICON]]
+
+With ICON, a picture file (JPEG or PNG; needs Pillow), icon0.png is made
+from it instead: the middle square of the picture, scaled to 128 x 128.
 """
 
 import os
@@ -195,17 +198,40 @@ IMAGES = [
 ]
 
 
+def icon_from_file(out, path):
+    """icon0.png from a picture: its square, from a little above the
+    middle, as 128 x 128 and 256 colours."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("no Pillow: not using " + path)
+        return
+    im = Image.open(path).convert("RGB")
+    side = min(im.size)
+    top = max(0, min(im.height - side, (im.height - side) * 2 // 5))
+    left = (im.width - side) // 2
+    im = im.crop((left, top, left + side, top + side)).resize((128, 128), Image.LANCZOS)
+    q = im.quantize(256, method=Image.Quantize.MEDIANCUT)
+    flat = q.getpalette()[:768]
+    palette = [tuple(flat[3 * i:3 * i + 3]) for i in range(len(flat) // 3)]
+    write_png(os.path.join(out, "icon0.png"), 128, 128, list(q.getdata()), palette)
+    print("icon from " + path)
+
+
 def main():
-    if len(sys.argv) not in (2, 3):
+    if len(sys.argv) not in (2, 3, 4):
         sys.exit(__doc__)
     out = sys.argv[1]
-    disc = sys.argv[2] if len(sys.argv) == 3 else ""
+    disc = sys.argv[2] if len(sys.argv) >= 3 else ""
+    icon = sys.argv[3] if len(sys.argv) == 4 else ""
     if disc and os.path.isfile(os.path.join(disc, "INSTALL.PIC")) \
             and os.path.isfile(os.path.join(disc, "BALTAZAR", "DATA", "IGN_LOGO.PIC")):
         game_art(out, disc)
         print("LiveArea art from " + disc)
     else:
         dusk(out)
+    if icon and os.path.isfile(icon):
+        icon_from_file(out, icon)
 
 
 if __name__ == "__main__":

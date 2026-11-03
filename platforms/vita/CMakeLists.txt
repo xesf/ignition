@@ -86,11 +86,17 @@ if(NOT DEFINED IGN_DISC)
         endif()
     endforeach()
 endif()
+# The bubble's picture, if data/ignition-icon.jpg is there (the repository
+# keeps no art of the game's).
+set(IGN_ICON ${ROOT}/data/ignition-icon.jpg)
+if(NOT EXISTS ${IGN_ICON})
+    set(IGN_ICON "")
+endif()
 set(SYS ${CMAKE_CURRENT_BINARY_DIR}/sce_sys)
 add_custom_command(
     OUTPUT ${SYS}/icon0.png ${SYS}/livearea/contents/bg.png ${SYS}/livearea/contents/startup.png
-    COMMAND python3 ${ROOT}/tools/vita_sce_sys.py ${SYS} "${IGN_DISC}"
-    DEPENDS ${ROOT}/tools/vita_sce_sys.py
+    COMMAND python3 ${ROOT}/tools/vita_sce_sys.py ${SYS} "${IGN_DISC}" "${IGN_ICON}"
+    DEPENDS ${ROOT}/tools/vita_sce_sys.py ${IGN_ICON}
     COMMENT "LiveArea art"
     VERBATIM)
 add_custom_target(ignition_sce_sys DEPENDS ${SYS}/icon0.png)

@@ -17,6 +17,7 @@ The GOG and Steam releases run as they are, with their Ogg Vorbis music; the Vit
 - On the Vita the race's 2D picture is shown from the game's own buffer without a copy, and rows that are empty are not compared, which took the frame's present step from 18 ms to about 7 ms.
 - On the Vita the menu's background film (see-through faces drawn in at most 16 layers; one past that is left out) runs at about 45 frames a second through its crash scenes (30 at the worst) instead of 5 when each face copied the screen.
 - The Vita reads the game from `ux0:data/ignition` when the game's files are there, and from `ux0:data/ignition/disc` as before. `make vita-deploy` and the LiveArea art look for a disc under `data/` or one folder down.
+- The Vita's bubble icon is made from `data/ignition-icon.jpg` when that file is there, and from the disc's pictures as before when it is not.
 - The stats line the Vita logs has the parts of the frame's present step and the 2D picture's rows.
 
 ### Fixed

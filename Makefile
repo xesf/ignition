@@ -113,7 +113,7 @@ $(BUILD)/%.o: $(SRCDIR)/%.m $(wildcard $(SRCDIR)/*.h $(SRCDIR)/*/*.h)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
 
 $(CD_EXTRACT): tools/cd_extract.c $(SRCDIR)/cdimage.c $(SRCDIR)/vorbis.c $(SRCDIR)/cdimage.h
-	$(CC) $(TOOL_CFLAGS) tools/cd_extract.c $(SRCDIR)/cdimage.c $(SRCDIR)/vorbis.c -o $@
+	$(CC) $(TOOL_CFLAGS) tools/cd_extract.c $(SRCDIR)/cdimage.c $(SRCDIR)/vorbis.c -lm -o $@
 
 # The engine without main.c, for tests.
 TEST_OBJ := $(filter-out $(BUILD)/main.o,$(CORE_OBJ)) $(HOST_OBJ)
